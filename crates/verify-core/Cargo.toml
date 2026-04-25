@@ -9,3 +9,4 @@ description = "VERIFY pipeline orchestrator and unified error type."
 [dependencies]
 log = { workspace = true }
 thiserror = { workspace = true }
+serde = { version = "1", features = ["derive"] }

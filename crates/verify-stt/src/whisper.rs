@@ -684,6 +684,70 @@ fn which_ffmpeg() -> bool {
         .unwrap_or(false)
 }
 
+/// Extract the audio track from a video container into a 16 kHz
+/// mono 16-bit WAV file. Routes through the same `ffmpeg` binary
+/// used by [`preprocess_audio`] for consistency. Returns the path
+/// to the extracted WAV.
+///
+/// Produces output at `<scratch_dir>/verify-video-<pid>-<ns>.wav`;
+/// callers are responsible for cleaning the file up after the
+/// downstream STT call (the existing `transcribe` flow already
+/// does this for its own scratch).
+pub fn extract_audio_from_video(
+    video_path: &Path,
+    scratch_dir: &Path,
+) -> Result<PathBuf, VerifyError> {
+    if !video_path.exists() {
+        return Err(VerifyError::InvalidInput(format!(
+            "video file not found: {:?}",
+            video_path
+        )));
+    }
+    if !which_ffmpeg() {
+        return Err(VerifyError::Stt(format!(
+            "ffmpeg not found on PATH — required for video {:?}. \
+             Install ffmpeg (e.g. `brew install ffmpeg`) to enable video processing.",
+            video_path
+        )));
+    }
+    std::fs::create_dir_all(scratch_dir)?;
+    let output = scratch_dir.join(format!(
+        "verify-video-{}-{}.wav",
+        std::process::id(),
+        random_suffix()
+    ));
+    debug!(
+        "extract_audio_from_video: {:?} → {:?} (16 kHz mono s16 WAV, no video)",
+        video_path, output
+    );
+    let status = std::process::Command::new("ffmpeg")
+        .arg("-y")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-i")
+        .arg(video_path)
+        // -vn drops the video stream; we only want the audio track.
+        .arg("-vn")
+        .arg("-ar")
+        .arg("16000")
+        .arg("-ac")
+        .arg("1")
+        .arg("-f")
+        .arg("wav")
+        .arg("-sample_fmt")
+        .arg("s16")
+        .arg(&output)
+        .status()
+        .map_err(|e| VerifyError::Stt(format!("failed to launch ffmpeg: {e}")))?;
+    if !status.success() {
+        return Err(VerifyError::Stt(format!(
+            "ffmpeg failed extracting audio from {:?}: exit {status}",
+            video_path
+        )));
+    }
+    Ok(output)
+}
+
 fn preprocess_via_ffmpeg(input: &Path, output: &Path) -> Result<(), VerifyError> {
     debug!(
         "preprocess_audio via ffmpeg: {:?} → {:?} (16 kHz mono s16 WAV)",
@@ -867,6 +931,16 @@ mod tests {
         assert_eq!(r.detected_language, "ar");
         assert!(r.confidence > 0.0);
         assert_eq!(r.segments.len(), 1);
+    }
+
+    #[test]
+    fn extract_audio_from_video_rejects_missing_input() {
+        let missing = Path::new("/nonexistent/clip.mp4");
+        let scratch = std::env::temp_dir().join("verify-video-test-missing");
+        match extract_audio_from_video(missing, &scratch) {
+            Err(VerifyError::InvalidInput(_)) => {}
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
     }
 
     #[test]

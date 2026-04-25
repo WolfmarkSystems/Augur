@@ -1,18 +1,16 @@
 //! Strata plugin adapter.
 //!
-//! # Sprint 2 status
+//! Default build (no features): exposes the adapter *shape* only —
+//! [`Confidence`], [`ArtifactRecord`], [`VerifyStrataPlugin`], and
+//! [`artifact_from_translation`]. This keeps VERIFY's standalone
+//! build lean (no FFI, no platform-specific filesystem parsers).
 //!
-//! The real `strata-plugin-sdk` crate is not yet present in this
-//! workspace, so we cannot link against the upstream `StrataPlugin`
-//! trait. Sprint 2 ships the adapter shape: a plugin metadata
-//! struct + an [`ArtifactRecord`] type that mirrors Strata's
-//! artifact surface, plus the [`artifact_from_translation`]
-//! converter that maps a [`verify_translate::TranslationResult`]
-//! into the artifact form Strata's UI consumes.
-//!
-//! When the upstream SDK is added to the workspace, the trait
-//! `impl` is a thin shim around these types — no business logic
-//! changes.
+//! `--features strata` build: pulls in the upstream
+//! `strata-plugin-sdk` (sibling Strata workspace at
+//! `~/Wolfmark/strata/crates/strata-plugin-sdk`) and provides a
+//! real `impl strata_plugin_sdk::StrataPlugin for VerifyStrataPlugin`.
+//! This is the production path when VERIFY is shipped as a Strata
+//! plugin alongside the rest of the Strata plugin grid.
 //!
 //! # Forensic safety invariant
 //!
@@ -20,7 +18,15 @@
 //! `is_advisory = true` and a non-empty `advisory_notice`. Same
 //! invariant Strata uses for its own MT/heuristic artifacts: if
 //! the analyst exports the result, the export must label it as
-//! machine-generated.
+//! machine-generated. Both the lean adapter shape *and* the real
+//! Strata trait impl share `artifact_from_translation` to enforce
+//! this in one place.
+
+#[cfg(feature = "strata")]
+mod strata_impl;
+
+#[cfg(feature = "strata")]
+pub use strata_impl::run_on_directory;
 
 use verify_translate::{TranslationResult, MACHINE_TRANSLATION_NOTICE};
 
@@ -117,6 +123,7 @@ mod tests {
             model: DEFAULT_NLLB_MODEL.into(),
             is_machine_translation: true,
             advisory_notice: MACHINE_TRANSLATION_NOTICE.into(),
+            segments: None,
         }
     }
 

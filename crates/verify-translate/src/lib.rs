@@ -56,6 +56,16 @@ pub const DEFAULT_NLLB_MODEL: &str = "facebook/nllb-200-distilled-600M";
 pub const NLLB_MODEL_URL_DISTILLED_600M: &str =
     "https://huggingface.co/facebook/nllb-200-distilled-600M";
 
+/// One translated chunk of audio/video, with timestamps preserved
+/// from the upstream STT segment.
+#[derive(Debug, Clone, Serialize)]
+pub struct TranslatedSegment {
+    pub start_ms: u64,
+    pub end_ms: u64,
+    pub source_text: String,
+    pub translated_text: String,
+}
+
 /// Result of a single translation call.
 #[derive(Debug, Clone)]
 pub struct TranslationResult {
@@ -73,6 +83,10 @@ pub struct TranslationResult {
     pub is_machine_translation: bool,
     /// Human-readable advisory notice. Always non-empty.
     pub advisory_notice: String,
+    /// Per-segment translations when the source came from STT
+    /// (audio / video). `None` for plain text or OCR inputs that
+    /// have no upstream timestamps.
+    pub segments: Option<Vec<TranslatedSegment>>,
 }
 
 /// Map ISO 639-1 to NLLB's BCP-47-ish language codes.
@@ -119,6 +133,30 @@ struct ScriptRequest<'a> {
     model: &'a str,
 }
 
+#[derive(Serialize)]
+struct Ct2ScriptRequest<'a> {
+    text: &'a str,
+    src: &'a str,
+    tgt: &'a str,
+    model: &'a str,
+    ct2_dir: &'a str,
+}
+
+/// Translation backend.
+///
+/// `Auto` (default) prefers the ctranslate2 worker when its
+/// converted model exists at `<hf_cache>/ct2/`; otherwise it falls
+/// back to the transformers worker. `Ctranslate2` forces ct2 (and
+/// triggers a one-time conversion on first use). `Transformers`
+/// forces the Sprint 2 transformers backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Backend {
+    #[default]
+    Auto,
+    Transformers,
+    Ctranslate2,
+}
+
 #[derive(Deserialize)]
 struct ScriptResponse {
     text: Option<String>,
@@ -126,20 +164,23 @@ struct ScriptResponse {
 }
 
 const NLLB_SCRIPT: &str = include_str!("script.py");
+const NLLB_SCRIPT_CT2: &str = include_str!("script_ct2.py");
 
 /// Translation engine. Holds the model id + cache root + python
 /// command; each [`TranslationEngine::translate`] call spawns a
-/// short-lived python subprocess against the bundled NLLB script.
+/// short-lived python subprocess against one of the bundled NLLB
+/// worker scripts (transformers or ctranslate2).
 #[derive(Debug, Clone)]
 pub struct TranslationEngine {
     pub model: String,
     pub python_cmd: String,
     pub hf_cache: Option<PathBuf>,
+    pub backend: Backend,
 }
 
 impl TranslationEngine {
     /// Default engine: `facebook/nllb-200-distilled-600M`, `python3`,
-    /// HF cache under `~/.cache/verify/models/nllb/`.
+    /// HF cache under `~/.cache/verify/models/nllb/`, backend `Auto`.
     pub fn with_xdg_cache() -> Result<Self, VerifyError> {
         let home = std::env::var("HOME").map_err(|_| {
             VerifyError::Translate("HOME not set; pass a cache dir explicitly".to_string())
@@ -148,7 +189,28 @@ impl TranslationEngine {
             model: DEFAULT_NLLB_MODEL.to_string(),
             python_cmd: "python3".to_string(),
             hf_cache: Some(PathBuf::from(home).join(".cache/verify/models/nllb")),
+            backend: Backend::default(),
         })
+    }
+
+    /// CT2 model directory: `<hf_cache>/ct2/`. Returns `None` when
+    /// no cache root is configured.
+    pub fn ct2_dir(&self) -> Option<PathBuf> {
+        self.hf_cache.as_ref().map(|p| p.join("ct2"))
+    }
+
+    /// Decide which backend to actually use this call. `Auto`
+    /// prefers ct2 when its converted model exists on disk;
+    /// otherwise transformers. The other variants pass through.
+    fn pick_backend(&self) -> Backend {
+        match self.backend {
+            Backend::Transformers => Backend::Transformers,
+            Backend::Ctranslate2 => Backend::Ctranslate2,
+            Backend::Auto => match self.ct2_dir() {
+                Some(p) if p.exists() && p.is_dir() => Backend::Ctranslate2,
+                _ => Backend::Transformers,
+            },
+        }
     }
 
     /// Run NLLB-200 translation and produce a [`TranslationResult`].
@@ -177,23 +239,93 @@ impl TranslationEngine {
             std::fs::create_dir_all(cache)?;
         }
 
-        warn!(
-            "verify-translate: invoking NLLB-200 ({src} → {tgt}) via {} — \
-             one-time HF model download on first run, all inference local.",
-            self.python_cmd
+        let chosen = self.pick_backend();
+        debug!("verify-translate: backend selection → {chosen:?}");
+        let translated = match chosen {
+            Backend::Ctranslate2 => match self.run_ct2(source_text, src, tgt) {
+                Ok(t) => t,
+                Err(e) if self.backend == Backend::Auto => {
+                    warn!(
+                        "verify-translate: ctranslate2 backend failed ({e}); \
+                         falling back to transformers."
+                    );
+                    self.run_transformers(source_text, src, tgt)?
+                }
+                Err(e) => return Err(e),
+            },
+            Backend::Transformers => self.run_transformers(source_text, src, tgt)?,
+            // Auto only resolves to Transformers/Ct2 above; this
+            // arm is unreachable but keeps the match exhaustive.
+            Backend::Auto => self.run_transformers(source_text, src, tgt)?,
+        };
+        info!(
+            "verify-translate: NLLB {src}→{tgt} produced {} chars",
+            translated.len()
         );
 
+        // NLLB does not expose a per-sentence confidence; we report
+        // a fixed value tagged as machine-derived. The advisory
+        // notice carries the real semantic.
+        Ok(self.advisory(
+            source_text,
+            &translated,
+            source_language,
+            target_language,
+            0.85,
+        ))
+    }
+
+    fn run_transformers(&self, text: &str, src: &str, tgt: &str) -> Result<String, VerifyError> {
+        warn!(
+            "verify-translate: invoking NLLB-200 ({src} → {tgt}) via transformers — \
+             one-time HF model download on first run, all inference local."
+        );
         let req = ScriptRequest {
-            text: source_text,
+            text,
             src,
             tgt,
             model: &self.model,
         };
         let req_json = serde_json::to_string(&req)
             .map_err(|e| VerifyError::Translate(format!("request serialise: {e}")))?;
+        self.run_python_worker(NLLB_SCRIPT, &req_json, "transformers")
+    }
 
+    fn run_ct2(&self, text: &str, src: &str, tgt: &str) -> Result<String, VerifyError> {
+        let ct2_dir = self.ct2_dir().ok_or_else(|| {
+            VerifyError::Translate(
+                "ctranslate2 backend requires a configured hf_cache (got None)".to_string(),
+            )
+        })?;
+        warn!(
+            "verify-translate: invoking NLLB-200 ({src} → {tgt}) via ctranslate2 \
+             (model dir {ct2_dir:?}) — one-time conversion on first run, all inference local."
+        );
+        if let Some(parent) = ct2_dir.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let req = Ct2ScriptRequest {
+            text,
+            src,
+            tgt,
+            model: &self.model,
+            ct2_dir: ct2_dir.to_str().ok_or_else(|| {
+                VerifyError::Translate(format!("ct2_dir not UTF-8: {ct2_dir:?}"))
+            })?,
+        };
+        let req_json = serde_json::to_string(&req)
+            .map_err(|e| VerifyError::Translate(format!("request serialise: {e}")))?;
+        self.run_python_worker(NLLB_SCRIPT_CT2, &req_json, "ctranslate2")
+    }
+
+    fn run_python_worker(
+        &self,
+        script: &str,
+        req_json: &str,
+        backend_name: &str,
+    ) -> Result<String, VerifyError> {
         let mut cmd = Command::new(&self.python_cmd);
-        cmd.arg("-c").arg(NLLB_SCRIPT);
+        cmd.arg("-c").arg(script);
         if let Some(cache) = &self.hf_cache {
             cmd.env("VERIFY_HF_CACHE", cache);
         }
@@ -203,9 +335,10 @@ impl TranslationEngine {
 
         let mut child = cmd.spawn().map_err(|e| {
             VerifyError::Translate(format!(
-                "failed to spawn {}: {e}. \
-                 Install Python 3 and `pip3 install --user transformers torch sentencepiece` \
-                 to enable NLLB-200 translation.",
+                "failed to spawn {} for {backend_name}: {e}. \
+                 Install Python 3 and the required packages \
+                 (`pip3 install --user transformers torch sentencepiece` \
+                 plus `ctranslate2` for the ct2 backend) to enable NLLB-200.",
                 self.python_cmd
             ))
         })?;
@@ -225,7 +358,7 @@ impl TranslationEngine {
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
         debug!(
-            "verify-translate: python exit={:?} stderr_bytes={} stdout_bytes={}",
+            "verify-translate: {backend_name} exit={:?} stderr_bytes={} stdout_bytes={}",
             output.status.code(),
             stderr.len(),
             stdout.len()
@@ -233,35 +366,20 @@ impl TranslationEngine {
 
         let resp: ScriptResponse = serde_json::from_str(stdout.trim()).map_err(|e| {
             VerifyError::Translate(format!(
-                "could not parse python response as JSON: {e}; \
+                "could not parse {backend_name} response as JSON: {e}; \
                  stdout={stdout:?}; stderr={stderr:?}"
             ))
         })?;
         if let Some(err) = resp.error {
             return Err(VerifyError::Translate(format!(
-                "NLLB worker error: {err}; stderr={stderr}"
+                "{backend_name} worker error: {err}; stderr={stderr}"
             )));
         }
-        let translated = resp.text.ok_or_else(|| {
+        resp.text.ok_or_else(|| {
             VerifyError::Translate(format!(
-                "NLLB worker returned no text and no error; stdout={stdout:?}"
+                "{backend_name} worker returned no text and no error; stdout={stdout:?}"
             ))
-        })?;
-        info!(
-            "verify-translate: NLLB {src}→{tgt} produced {} chars",
-            translated.len()
-        );
-
-        // NLLB does not expose a per-sentence confidence; we report
-        // a fixed value tagged as machine-derived. The advisory
-        // notice carries the real semantic.
-        Ok(self.advisory(
-            source_text,
-            &translated,
-            source_language,
-            target_language,
-            0.85,
-        ))
+        })
     }
 
     fn advisory(
@@ -281,7 +399,64 @@ impl TranslationEngine {
             model: self.model.clone(),
             is_machine_translation: true,
             advisory_notice: MACHINE_TRANSLATION_NOTICE.to_string(),
+            segments: None,
         }
+    }
+
+    /// Translate a list of timestamped STT segments, producing both
+    /// a full concatenated translation and per-segment timestamped
+    /// translations. Each segment is translated independently — this
+    /// is what gives examiners a translated transcript that lines up
+    /// in time with the original audio.
+    ///
+    /// Empty-text segments are skipped (they preserve their
+    /// timestamps in the resulting list with empty `translated_text`).
+    pub fn translate_segments(
+        &self,
+        segments: &[(u64, u64, String)],
+        source_language: &str,
+        target_language: &str,
+    ) -> Result<TranslationResult, VerifyError> {
+        let mut translated: Vec<TranslatedSegment> = Vec::with_capacity(segments.len());
+        for (start_ms, end_ms, text) in segments {
+            if text.trim().is_empty() {
+                translated.push(TranslatedSegment {
+                    start_ms: *start_ms,
+                    end_ms: *end_ms,
+                    source_text: text.clone(),
+                    translated_text: String::new(),
+                });
+                continue;
+            }
+            let r = self.translate(text, source_language, target_language)?;
+            translated.push(TranslatedSegment {
+                start_ms: *start_ms,
+                end_ms: *end_ms,
+                source_text: text.clone(),
+                translated_text: r.translated_text,
+            });
+        }
+        let full_source = segments
+            .iter()
+            .map(|(_, _, t)| t.trim())
+            .filter(|t| !t.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let full_translated = translated
+            .iter()
+            .map(|t| t.translated_text.trim())
+            .filter(|t| !t.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut out = self.advisory(
+            &full_source,
+            &full_translated,
+            source_language,
+            target_language,
+            0.85,
+        );
+        out.segments = Some(translated);
+        Ok(out)
     }
 }
 
@@ -334,6 +509,7 @@ mod tests {
             model: DEFAULT_NLLB_MODEL.to_string(),
             python_cmd: "python3".to_string(),
             hf_cache: None,
+            backend: Backend::Auto,
         };
         // Use the empty-input fast path — it never spawns python,
         // so the test is hermetic but still exercises the result-
@@ -361,9 +537,81 @@ mod tests {
             model: DEFAULT_NLLB_MODEL.into(),
             is_machine_translation: true,
             advisory_notice: MACHINE_TRANSLATION_NOTICE.into(),
+            segments: None,
         };
         assert!(r.is_machine_translation);
         assert!(!r.advisory_notice.is_empty());
+    }
+
+    #[test]
+    fn translated_segments_preserve_timestamps_for_empty_inputs() {
+        // The empty-input fast path is hermetic: it never spawns
+        // python and so is safe to call in unit tests. Verifies
+        // that timestamp fields round-trip through the segment
+        // list — this is the load-bearing invariant for the video
+        // pipeline (examiners must know WHEN each phrase was said).
+        let engine = TranslationEngine {
+            model: DEFAULT_NLLB_MODEL.into(),
+            python_cmd: "python3".into(),
+            hf_cache: None,
+            backend: Backend::Auto,
+        };
+        let segs = vec![
+            (0u64, 1_500u64, String::new()),
+            (1_500u64, 3_000u64, "   ".into()),
+        ];
+        let r = engine
+            .translate_segments(&segs, "ar", "en")
+            .expect("empty-segment fast path");
+        assert!(r.is_machine_translation);
+        assert!(!r.advisory_notice.is_empty());
+        let out = r.segments.expect("segments populated");
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].start_ms, 0);
+        assert_eq!(out[0].end_ms, 1_500);
+        assert_eq!(out[1].start_ms, 1_500);
+        assert_eq!(out[1].end_ms, 3_000);
+    }
+
+    #[test]
+    fn backend_auto_falls_back_to_transformers_when_ct2_dir_absent() {
+        // Auto backend prefers ct2 when its directory exists; with
+        // a fresh temp cache (no ct2 subdir), it must select
+        // transformers — that is the documented graceful-fallback
+        // behavior the Sprint 3 spec calls out.
+        let tmp = std::env::temp_dir()
+            .join(format!("verify-translate-backend-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let engine = TranslationEngine {
+            model: DEFAULT_NLLB_MODEL.into(),
+            python_cmd: "python3".into(),
+            hf_cache: Some(tmp.clone()),
+            backend: Backend::Auto,
+        };
+        assert_eq!(engine.pick_backend(), Backend::Transformers);
+
+        // Once we materialise the ct2 directory, Auto picks ct2.
+        std::fs::create_dir_all(tmp.join("ct2")).expect("mkdir ct2");
+        assert_eq!(engine.pick_backend(), Backend::Ctranslate2);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn explicit_backends_override_auto() {
+        let engine = TranslationEngine {
+            model: DEFAULT_NLLB_MODEL.into(),
+            python_cmd: "python3".into(),
+            hf_cache: None,
+            backend: Backend::Transformers,
+        };
+        assert_eq!(engine.pick_backend(), Backend::Transformers);
+        let engine = TranslationEngine {
+            model: DEFAULT_NLLB_MODEL.into(),
+            python_cmd: "python3".into(),
+            hf_cache: None,
+            backend: Backend::Ctranslate2,
+        };
+        assert_eq!(engine.pick_backend(), Backend::Ctranslate2);
     }
 
     #[test]

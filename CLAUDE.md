@@ -229,14 +229,63 @@ opt-in API.
   The `StrataPlugin` trait `impl` is a thin shim landed when the
   SDK appears.
 
-## What remains for Sprint 3+
+## Sprint 3 decisions (shipped 2026-04-25)
 
-- Video pipeline (ffmpeg audio extract → existing STT → NLLB).
-- Real Strata plugin trait `impl` (requires upstream SDK in workspace).
-- Integration tests against real audio / image fixtures
-  (currently `#[ignore]`-gated on `VERIFY_RUN_INTEGRATION_TESTS=1`).
+- **Video pipeline — ffmpeg `-vn` audio extraction.** New
+  `verify_stt::extract_audio_from_video` writes a 16 kHz mono WAV
+  to a scratch dir and hands off to the Sprint 2 STT path.
+  `PipelineInput::Video` was added to verify-core; the CLI auto-
+  detects video by extension via `detect_input_kind` (mp4/mov/
+  avi/mkv/m4v/wmv/webm/3gp). Translated transcripts preserve
+  per-segment timestamps via `TranslationEngine::translate_segments`,
+  which translates each STT segment independently and pins
+  `[start_ms, end_ms, source_text, translated_text]` tuples on
+  the result.
+- **ctranslate2 NLLB swap with graceful fallback.** A second
+  bundled worker script (`crates/verify-translate/src/script_ct2.py`)
+  runs the same `facebook/nllb-200-distilled-600M` via ctranslate2.
+  `TranslationEngine::backend` is `Backend::Auto` by default,
+  preferring ct2 when its converted model exists at
+  `<hf_cache>/ct2/`; otherwise it falls back to the Sprint 2
+  transformers worker. Explicit `Backend::Ctranslate2` triggers
+  a one-time HF→CT2 conversion (int8 quantization) via the python
+  `TransformersConverter`. The CLI exposes
+  `--translation-backend auto|transformers|ct2`. Live benchmark
+  was not run on this build host (sentencepiece + transformers
+  were not installed); literature reports 3–5× CPU speedup, which
+  the spec author cited as the motivating gain.
+- **Batch processing.** New `verify batch` subcommand walks a
+  directory recursively, classifies each file, translates the
+  foreign-language ones, and writes a JSON report carrying the
+  mandatory machine-translation notice at the top level. Per-file
+  errors are captured into the report's `error` field so one bad
+  file cannot abort a 1 000-file evidence run. Symlinks are not
+  followed (forensic discipline). The walker uses
+  `std::fs::read_dir` recursively rather than pulling in
+  `walkdir` — fewer deps.
+- **Real Strata plugin trait — feature-gated.** Vendoring the
+  full Strata `strata-plugin-sdk` tree into VERIFY pulls
+  `strata-fs`, which transitively requires NTFS/APFS/ext4/EWF
+  filesystem parsers. That violates the "no unnecessary
+  dependencies" hard rule for a translation tool. Resolution: the
+  real `impl StrataPlugin for VerifyStrataPlugin` lives behind
+  the `strata` feature in `verify-plugin-sdk` and is a path
+  dependency to `~/Wolfmark/strata/crates/strata-plugin-sdk`
+  (sibling workspace). Default build stays lean; `cargo build
+  --features verify-plugin-sdk/strata` opts in. The advisory
+  notice survives Strata's `ArtifactRecord` shape (which has no
+  `is_advisory` field) by living in two places: a `[MT — review
+  by a certified human translator]` prefix on the artifact
+  `title` and the `is_machine_translation` + `advisory_notice`
+  keys in `raw_data`. Both are pinned by
+  `assert_advisory_invariant` and four feature-gated tests.
+
+## What remains for Sprint 4+
+
 - Whisper temperature-fallback decoding + full timestamp rules
-  (Sprint 2 ships greedy + suppress_tokens; matches behaviour
-  for the dominant case but can diverge on highly noisy audio).
-- ctranslate2 backend swap for NLLB (Option C, 3–5× faster than
-  raw transformers on CPU).
+  (Sprint 2 ships greedy + suppress_tokens).
+- Speaker diarization (who said what).
+- PDF text extraction.
+- Real-time transcription (post-v1.0).
+- Live ctranslate2 benchmark on a machine with both transformers
+  and ctranslate2 fully installed.

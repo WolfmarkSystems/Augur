@@ -8,6 +8,6 @@
 pub mod whisper;
 
 pub use whisper::{
-    ModelManager, SttEngine, SttResult, SttSegment, WhisperPaths, WhisperPreset,
-    WHISPER_MODEL_URL_BASE, WHISPER_MODEL_URL_LARGE_V3, WHISPER_MODEL_URL_TINY,
+    extract_audio_from_video, ModelManager, SttEngine, SttResult, SttSegment, WhisperPaths,
+    WhisperPreset, WHISPER_MODEL_URL_BASE, WHISPER_MODEL_URL_LARGE_V3, WHISPER_MODEL_URL_TINY,
 };

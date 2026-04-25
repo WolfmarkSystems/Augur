@@ -16,6 +16,7 @@ verify-classifier = { path = "../../crates/verify-classifier" }
 verify-stt = { path = "../../crates/verify-stt" }
 verify-translate = { path = "../../crates/verify-translate" }
 verify-ocr = { path = "../../crates/verify-ocr" }
+serde_json = "1"
 clap = { version = "4", features = ["derive"] }
 log = { workspace = true }
 env_logger = "0.11"
