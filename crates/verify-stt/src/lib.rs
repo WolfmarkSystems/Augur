@@ -6,4 +6,7 @@
 
 pub mod whisper;
 
-pub use whisper::{SttEngine, SttResult, SttSegment, WhisperPreset};
+pub use whisper::{
+    ModelManager, SttEngine, SttResult, SttSegment, WhisperPreset,
+    WHISPER_MODEL_URL_BASE, WHISPER_MODEL_URL_LARGE_V3, WHISPER_MODEL_URL_TINY,
+};

@@ -10,3 +10,15 @@ description = "Whisper STT — audio → transcript + language + segments. Sprin
 verify-core = { path = "../verify-core" }
 log = { workspace = true }
 thiserror = { workspace = true }
+# WAV decoding fallback when ffmpeg is unavailable (hound is pure
+# Rust — no FFI). The ffmpeg subprocess handles every other
+# container (MP3, M4A, MP4 audio, OGG, FLAC).
+hound = "3.5"
+# whisper-rs (`whisper-rs = "0.16"`) was evaluated in Sprint 1 P3.
+# It wraps whisper.cpp via FFI and requires `cmake` + a C++
+# toolchain at build time. We kept it OUT of the default deps to
+# preserve VERIFY's pure-Rust build story (matches the fastText
+# 0.8 pure-Rust choice in P2). Sprint 2 re-evaluates: either gate
+# whisper-rs behind an opt-in feature flag, or switch to a
+# pure-Rust whisper port when one stabilises. See CLAUDE.md
+# "Sprint 2 deferrals" for the current state.
