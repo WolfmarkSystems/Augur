@@ -30,3 +30,8 @@ hf-hub = "0.5.0"
 tokenizers = "0.22.2"
 byteorder = "1.5"
 serde_json = "1"
+# Used for temperature-fallback sampling in the Whisper decoder
+# (Sprint 4 P2). At temperature 0 the decoder is purely greedy
+# (argmax) and never touches the RNG; only retry attempts at T>0
+# draw samples.
+rand = "0.9"

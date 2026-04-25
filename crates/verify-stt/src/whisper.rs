@@ -31,9 +31,81 @@ use candle_transformers::models::whisper::{
     self as m, audio as whisper_audio, model::Whisper, Config,
 };
 use log::{debug, info, warn};
+use rand::distr::weighted::WeightedIndex;
+use rand::distr::Distribution;
+use rand::SeedableRng;
 use std::path::{Path, PathBuf};
 use tokenizers::Tokenizer;
 use verify_core::VerifyError;
+
+/// Options controlling Whisper decoding. Sprint 4 P2 introduces
+/// temperature fallback: if the greedy (T=0) decode looks like a
+/// hallucination — gauged by a too-low compression ratio on the
+/// produced text — the decoder retries the same segment with
+/// progressively higher temperature, sampling from
+/// `softmax(logits / T)` instead of taking the argmax.
+///
+/// Defaults match OpenAI's `whisper` reference for the parts we
+/// implement; the no-speech threshold gate exits the retry loop
+/// early when Whisper itself reports the segment is silent.
+#[derive(Debug, Clone, Copy)]
+pub struct TranscribeOptions {
+    pub preset: WhisperPreset,
+    /// Initial decoding temperature. `0.0` = greedy.
+    pub temperature: f32,
+    /// Step size added to `temperature` between retries.
+    pub temperature_increment: f32,
+    /// Maximum number of *additional* retries on top of the first
+    /// attempt. `5` matches OpenAI's reference.
+    pub max_temperature_retries: u8,
+    /// `<|nospeech|>` probability above which the segment is
+    /// considered silence and the retry loop exits.
+    pub no_speech_threshold: f32,
+    /// Minimum unique-character ratio of the produced transcript.
+    /// Below this the segment is considered a hallucination
+    /// (e.g. "aaaaaaaa…") and a retry at higher temperature is
+    /// triggered. The naming preserves the Sprint 4 spec's
+    /// `compression_ratio_threshold` while the actual metric is
+    /// the unique/total ratio defined by [`compression_ratio`].
+    pub compression_ratio_threshold: f32,
+    /// Seed for the temperature-sampling RNG. Default chosen so
+    /// reruns with the same audio + same seed produce identical
+    /// transcripts (forensic reproducibility).
+    pub rng_seed: u64,
+}
+
+impl Default for TranscribeOptions {
+    fn default() -> Self {
+        Self {
+            preset: WhisperPreset::Fast,
+            temperature: 0.0,
+            temperature_increment: 0.2,
+            max_temperature_retries: 5,
+            no_speech_threshold: 0.6,
+            // Hallucinated transcripts collapse to a tiny set of
+            // characters; production speech sits above 0.3 in
+            // practice. Spec used 2.4 for the inverse OpenAI metric;
+            // we use the unique/total form, hence 0.3.
+            compression_ratio_threshold: 0.3,
+            rng_seed: 299_792_458,
+        }
+    }
+}
+
+/// Unique-character ratio of `text`. Returns 0.0 for empty input.
+/// Repetitive text ("aaaaaaa") collapses to a low ratio
+/// (≈ 0.1); normal multi-word text sits above 0.3.
+pub fn compression_ratio(text: &str) -> f32 {
+    if text.is_empty() {
+        return 0.0;
+    }
+    let total: usize = text.chars().count();
+    if total == 0 {
+        return 0.0;
+    }
+    let unique: std::collections::HashSet<char> = text.chars().collect();
+    unique.len() as f32 / total as f32
+}
 
 /// Whisper model presets. Speed / accuracy tradeoff.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -330,11 +402,26 @@ impl SttEngine {
         })
     }
 
-    /// Transcribe an arbitrary audio file. Preprocesses to 16 kHz
-    /// mono PCM, runs the full encoder + decoder pipeline, returns
-    /// [`SttResult`] with timestamped segments and a Whisper-detected
-    /// language code (ISO 639-1).
+    /// Transcribe an arbitrary audio file with the engine's preset
+    /// and the default [`TranscribeOptions`]. Equivalent to
+    /// [`SttEngine::transcribe_with_options`] with an option block
+    /// whose `preset` matches the engine.
     pub fn transcribe(&mut self, audio_path: &Path) -> Result<SttResult, VerifyError> {
+        let options = TranscribeOptions {
+            preset: self.preset,
+            ..TranscribeOptions::default()
+        };
+        self.transcribe_with_options(audio_path, &options)
+    }
+
+    /// Transcribe with explicit decoding options. Honors the
+    /// per-segment temperature-fallback retry loop described on
+    /// [`TranscribeOptions`]. Temperature 0 → greedy; T>0 → sampled.
+    pub fn transcribe_with_options(
+        &mut self,
+        audio_path: &Path,
+        options: &TranscribeOptions,
+    ) -> Result<SttResult, VerifyError> {
         if !audio_path.exists() {
             return Err(VerifyError::InvalidInput(format!(
                 "audio file not found: {:?}",
@@ -364,7 +451,7 @@ impl SttEngine {
             lang_code, lang_conf, self.preset
         );
 
-        let segments = self.run_decoder(&mel, lang_token)?;
+        let segments = self.run_decoder(&mel, lang_token, options)?;
 
         let transcript = segments
             .iter()
@@ -431,31 +518,19 @@ impl SttEngine {
         Ok((code, lang_token, best_prob))
     }
 
-    /// Greedy decoding loop with timestamps mode enabled. Each
-    /// 30-second mel segment yields a list of timestamp tokens and
-    /// text tokens; we split the text by timestamp boundaries to
-    /// produce [`SttSegment`]s.
+    /// Decoding loop with timestamps mode enabled and per-segment
+    /// temperature fallback. Each 30-second mel chunk is decoded;
+    /// if the result looks like a hallucination (compression ratio
+    /// below threshold) and Whisper does not flag the chunk as
+    /// silent, the chunk is re-decoded at progressively higher
+    /// temperature up to `options.max_temperature_retries` times.
     fn run_decoder(
         &mut self,
         mel: &Tensor,
         language_token: u32,
+        options: &TranscribeOptions,
     ) -> Result<Vec<SttSegment>, VerifyError> {
-        let no_timestamps_token = token_id(&self.tokenizer, m::NO_TIMESTAMPS_TOKEN)?;
-        let sot_token = token_id(&self.tokenizer, m::SOT_TOKEN)?;
-        let transcribe_token = token_id(&self.tokenizer, m::TRANSCRIBE_TOKEN)?;
-        let eot_token = token_id(&self.tokenizer, m::EOT_TOKEN)?;
-
-        let vocab_size = self.config.vocab_size as u32;
-        let suppress_vec: Vec<f32> = (0..vocab_size)
-            .map(|i| {
-                if self.config.suppress_tokens.contains(&i) {
-                    f32::NEG_INFINITY
-                } else {
-                    0f32
-                }
-            })
-            .collect();
-        let suppress = Tensor::new(suppress_vec.as_slice(), &self.device).map_err(stt_err)?;
+        let cx = DecoderContext::new(self, options)?;
 
         let (_, _, content_frames) = mel.dims3().map_err(stt_err)?;
         let mut seek = 0usize;
@@ -468,112 +543,301 @@ impl SttEngine {
             let segment_duration_s =
                 (segment_size * m::HOP_LENGTH) as f64 / m::SAMPLE_RATE as f64;
 
-            let audio_features = self
-                .model
-                .encoder
-                .forward(&mel_segment, true)
-                .map_err(stt_err)?;
-            let sample_len = self.config.max_target_positions / 2;
-            let mut tokens: Vec<u32> = vec![sot_token, language_token, transcribe_token];
-
-            for i in 0..sample_len {
-                let tokens_t = Tensor::new(tokens.as_slice(), &self.device)
-                    .map_err(stt_err)?
-                    .unsqueeze(0)
-                    .map_err(stt_err)?;
-                let ys = self
-                    .model
-                    .decoder
-                    .forward(&tokens_t, &audio_features, i == 0)
-                    .map_err(stt_err)?;
-                let (_, seq_len, _) = ys.dims3().map_err(stt_err)?;
-                let logits = self
-                    .model
-                    .decoder
-                    .final_linear(&ys.i((..1, seq_len - 1..)).map_err(stt_err)?)
-                    .map_err(stt_err)?
-                    .i(0)
-                    .map_err(stt_err)?
-                    .i(0)
-                    .map_err(stt_err)?;
-                let logits = logits.broadcast_add(&suppress).map_err(stt_err)?;
-                let logits_v: Vec<f32> = logits.to_vec1().map_err(stt_err)?;
-                let next_token = logits_v
-                    .iter()
-                    .enumerate()
-                    .max_by(|(_, a), (_, b)| a.total_cmp(b))
-                    .map(|(idx, _)| idx as u32)
-                    .ok_or_else(|| VerifyError::Stt("empty logits".into()))?;
-                tokens.push(next_token);
-                if next_token == eot_token || tokens.len() > self.config.max_target_positions {
+            let mut temperature = options.temperature;
+            let max_attempts = options.max_temperature_retries.saturating_add(1) as u32;
+            let mut accepted: Option<DecodedSegment> = None;
+            for attempt in 0..max_attempts {
+                let decoded = self.decode_segment(
+                    &mel_segment,
+                    language_token,
+                    &cx,
+                    temperature,
+                    options,
+                )?;
+                let ratio = compression_ratio(&decoded.raw_text);
+                if decoded.no_speech_prob > options.no_speech_threshold {
+                    debug!(
+                        "Whisper: segment {time_offset_s:.1}s flagged as silence \
+                         (no_speech={:.2}); accepting at temperature {temperature:.2}",
+                        decoded.no_speech_prob
+                    );
+                    accepted = Some(decoded);
                     break;
                 }
+                if ratio >= options.compression_ratio_threshold {
+                    accepted = Some(decoded);
+                    break;
+                }
+                if attempt + 1 == max_attempts {
+                    warn!(
+                        "Whisper: max temperature retries reached ({}); \
+                         returning best attempt at {temperature:.2} \
+                         (compression_ratio={ratio:.2}, no_speech={:.2})",
+                        options.max_temperature_retries, decoded.no_speech_prob
+                    );
+                    accepted = Some(decoded);
+                    break;
+                }
+                debug!(
+                    "Whisper: segment {time_offset_s:.1}s retry {} at \
+                     temperature {temperature:.2} (compression_ratio={ratio:.2}, \
+                     no_speech={:.2})",
+                    attempt + 1,
+                    decoded.no_speech_prob
+                );
+                temperature += options.temperature_increment;
             }
 
-            // Parse timestamps + text out of the produced token stream.
-            // Whisper emits `<|t.tt|>` timestamp tokens that frame
-            // text spans; tokens above `no_timestamps_token` are
-            // timestamps, with each step worth 0.02 s.
-            let mut current_text: Vec<u32> = Vec::new();
-            let mut last_ts_s: Option<f32> = None;
-            for &tok in &tokens {
-                if tok == sot_token
-                    || tok == eot_token
-                    || tok == language_token
-                    || tok == transcribe_token
-                {
-                    continue;
-                }
-                if tok > no_timestamps_token {
-                    let ts_s = (tok - no_timestamps_token - 1) as f32 * 0.02;
-                    if let Some(prev) = last_ts_s {
-                        if !current_text.is_empty() {
-                            let text = self
-                                .tokenizer
-                                .decode(&current_text, true)
-                                .map_err(|e| VerifyError::Stt(format!("tokenizer decode: {e}")))?;
-                            let trimmed = text.trim().to_string();
-                            if !trimmed.is_empty() {
-                                let start_s = time_offset_s + prev as f64;
-                                let end_s = time_offset_s + ts_s as f64;
-                                out.push(SttSegment {
-                                    start_ms: (start_s * 1000.0) as u64,
-                                    end_ms: (end_s * 1000.0) as u64,
-                                    text: trimmed,
-                                });
-                            }
-                            current_text.clear();
-                        }
-                    }
-                    last_ts_s = Some(ts_s);
-                } else {
-                    current_text.push(tok);
-                }
-            }
-            // Tail text without a closing timestamp — attribute to the
-            // remainder of the segment.
-            if !current_text.is_empty() {
-                let text = self
-                    .tokenizer
-                    .decode(&current_text, true)
-                    .map_err(|e| VerifyError::Stt(format!("tokenizer decode: {e}")))?;
-                let trimmed = text.trim().to_string();
-                if !trimmed.is_empty() {
-                    let start_s = time_offset_s + last_ts_s.unwrap_or(0.0) as f64;
-                    let end_s = time_offset_s + segment_duration_s;
-                    out.push(SttSegment {
-                        start_ms: (start_s * 1000.0) as u64,
-                        end_ms: (end_s * 1000.0) as u64,
-                        text: trimmed,
-                    });
-                }
-            }
+            let decoded = accepted.ok_or_else(|| {
+                VerifyError::Stt("temperature fallback produced no result".into())
+            })?;
+            self.expand_segments(
+                &decoded.tokens,
+                &cx,
+                language_token,
+                time_offset_s,
+                segment_duration_s,
+                &mut out,
+            )?;
 
             seek += segment_size;
         }
 
         Ok(out)
     }
+
+    fn decode_segment(
+        &mut self,
+        mel_segment: &Tensor,
+        language_token: u32,
+        cx: &DecoderContext,
+        temperature: f32,
+        options: &TranscribeOptions,
+    ) -> Result<DecodedSegment, VerifyError> {
+        let audio_features = self
+            .model
+            .encoder
+            .forward(mel_segment, true)
+            .map_err(stt_err)?;
+        let sample_len = self.config.max_target_positions / 2;
+        let mut tokens: Vec<u32> = vec![cx.sot_token, language_token, cx.transcribe_token];
+        let mut no_speech_prob: f32 = 0.0;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(options.rng_seed);
+
+        for i in 0..sample_len {
+            let tokens_t = Tensor::new(tokens.as_slice(), &self.device)
+                .map_err(stt_err)?
+                .unsqueeze(0)
+                .map_err(stt_err)?;
+            let ys = self
+                .model
+                .decoder
+                .forward(&tokens_t, &audio_features, i == 0)
+                .map_err(stt_err)?;
+
+            // First iteration: read the no-speech probability from
+            // the very first logits row. Mirrors the candle
+            // reference exactly.
+            if i == 0 {
+                let logits0 = self
+                    .model
+                    .decoder
+                    .final_linear(&ys.i(..1).map_err(stt_err)?)
+                    .map_err(stt_err)?
+                    .i(0)
+                    .map_err(stt_err)?
+                    .i(0)
+                    .map_err(stt_err)?;
+                let probs = softmax(&logits0, 0).map_err(stt_err)?;
+                no_speech_prob = probs
+                    .i(cx.no_speech_token as usize)
+                    .map_err(stt_err)?
+                    .to_scalar::<f32>()
+                    .map_err(stt_err)?;
+            }
+
+            let (_, seq_len, _) = ys.dims3().map_err(stt_err)?;
+            let logits = self
+                .model
+                .decoder
+                .final_linear(&ys.i((..1, seq_len - 1..)).map_err(stt_err)?)
+                .map_err(stt_err)?
+                .i(0)
+                .map_err(stt_err)?
+                .i(0)
+                .map_err(stt_err)?;
+            let logits = logits.broadcast_add(&cx.suppress).map_err(stt_err)?;
+
+            let next_token = if temperature > 0.0 {
+                let scaled = (&logits / temperature as f64).map_err(stt_err)?;
+                let probs = softmax(&scaled, 0).map_err(stt_err)?;
+                let probs_v: Vec<f32> = probs.to_vec1().map_err(stt_err)?;
+                let dist = WeightedIndex::new(&probs_v).map_err(|e| {
+                    VerifyError::Stt(format!("WeightedIndex (T={temperature}): {e}"))
+                })?;
+                dist.sample(&mut rng) as u32
+            } else {
+                let logits_v: Vec<f32> = logits.to_vec1().map_err(stt_err)?;
+                logits_v
+                    .iter()
+                    .enumerate()
+                    .max_by(|(_, a), (_, b)| a.total_cmp(b))
+                    .map(|(idx, _)| idx as u32)
+                    .ok_or_else(|| VerifyError::Stt("empty logits".into()))?
+            };
+            tokens.push(next_token);
+            if next_token == cx.eot_token || tokens.len() > self.config.max_target_positions {
+                break;
+            }
+        }
+
+        // Pre-decode the raw text so the temperature-fallback gate
+        // can inspect it without needing the tokenizer again.
+        let text_tokens: Vec<u32> = tokens
+            .iter()
+            .copied()
+            .filter(|&t| {
+                t != cx.sot_token
+                    && t != cx.eot_token
+                    && t != language_token
+                    && t != cx.transcribe_token
+                    && t <= cx.no_timestamps_token
+            })
+            .collect();
+        let raw_text = self
+            .tokenizer
+            .decode(&text_tokens, true)
+            .map_err(|e| VerifyError::Stt(format!("tokenizer decode: {e}")))?;
+
+        Ok(DecodedSegment {
+            tokens,
+            raw_text,
+            no_speech_prob,
+        })
+    }
+
+    /// Walk the produced token stream and emit one [`SttSegment`]
+    /// per timestamp pair. Whisper emits `<|t.tt|>` tokens that
+    /// frame text spans; tokens above `no_timestamps_token` are
+    /// timestamps with 0.02 s resolution.
+    fn expand_segments(
+        &self,
+        tokens: &[u32],
+        cx: &DecoderContext,
+        language_token: u32,
+        time_offset_s: f64,
+        segment_duration_s: f64,
+        out: &mut Vec<SttSegment>,
+    ) -> Result<(), VerifyError> {
+        let mut current_text: Vec<u32> = Vec::new();
+        let mut last_ts_s: Option<f32> = None;
+        for &tok in tokens {
+            if tok == cx.sot_token
+                || tok == cx.eot_token
+                || tok == language_token
+                || tok == cx.transcribe_token
+            {
+                continue;
+            }
+            if tok > cx.no_timestamps_token {
+                let ts_s = (tok - cx.no_timestamps_token - 1) as f32 * 0.02;
+                if let Some(prev) = last_ts_s {
+                    if !current_text.is_empty() {
+                        let text = self
+                            .tokenizer
+                            .decode(&current_text, true)
+                            .map_err(|e| VerifyError::Stt(format!("tokenizer decode: {e}")))?;
+                        let trimmed = text.trim().to_string();
+                        if !trimmed.is_empty() {
+                            let start_s = time_offset_s + prev as f64;
+                            let end_s = time_offset_s + ts_s as f64;
+                            out.push(SttSegment {
+                                start_ms: (start_s * 1000.0) as u64,
+                                end_ms: (end_s * 1000.0) as u64,
+                                text: trimmed,
+                            });
+                        }
+                        current_text.clear();
+                    }
+                }
+                last_ts_s = Some(ts_s);
+            } else {
+                current_text.push(tok);
+            }
+        }
+        if !current_text.is_empty() {
+            let text = self
+                .tokenizer
+                .decode(&current_text, true)
+                .map_err(|e| VerifyError::Stt(format!("tokenizer decode: {e}")))?;
+            let trimmed = text.trim().to_string();
+            if !trimmed.is_empty() {
+                let start_s = time_offset_s + last_ts_s.unwrap_or(0.0) as f64;
+                let end_s = time_offset_s + segment_duration_s;
+                out.push(SttSegment {
+                    start_ms: (start_s * 1000.0) as u64,
+                    end_ms: (end_s * 1000.0) as u64,
+                    text: trimmed,
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Per-call cached decoder constants — token ids, suppress mask.
+/// Lifted out so the per-segment retry loop reuses the suppress
+/// tensor instead of rebuilding it per attempt.
+struct DecoderContext {
+    no_timestamps_token: u32,
+    sot_token: u32,
+    transcribe_token: u32,
+    eot_token: u32,
+    no_speech_token: u32,
+    suppress: Tensor,
+}
+
+impl DecoderContext {
+    fn new(engine: &SttEngine, _opts: &TranscribeOptions) -> Result<Self, VerifyError> {
+        let no_timestamps_token = token_id(&engine.tokenizer, m::NO_TIMESTAMPS_TOKEN)?;
+        let sot_token = token_id(&engine.tokenizer, m::SOT_TOKEN)?;
+        let transcribe_token = token_id(&engine.tokenizer, m::TRANSCRIBE_TOKEN)?;
+        let eot_token = token_id(&engine.tokenizer, m::EOT_TOKEN)?;
+        let no_speech_token = m::NO_SPEECH_TOKENS
+            .iter()
+            .find_map(|t| engine.tokenizer.token_to_id(t))
+            .ok_or_else(|| VerifyError::Stt("no <|nospeech|> token id".into()))?;
+
+        let vocab_size = engine.config.vocab_size as u32;
+        let suppress_vec: Vec<f32> = (0..vocab_size)
+            .map(|i| {
+                if engine.config.suppress_tokens.contains(&i) {
+                    f32::NEG_INFINITY
+                } else {
+                    0f32
+                }
+            })
+            .collect();
+        let suppress =
+            Tensor::new(suppress_vec.as_slice(), &engine.device).map_err(stt_err)?;
+        Ok(Self {
+            no_timestamps_token,
+            sot_token,
+            transcribe_token,
+            eot_token,
+            no_speech_token,
+            suppress,
+        })
+    }
+}
+
+/// One attempt at decoding a 30 s mel chunk. The retry loop in
+/// [`SttEngine::run_decoder`] inspects `raw_text` + `no_speech_prob`
+/// to decide whether to accept or retry at higher temperature.
+struct DecodedSegment {
+    tokens: Vec<u32>,
+    raw_text: String,
+    no_speech_prob: f32,
 }
 
 fn stt_err(e: candle_core::Error) -> VerifyError {
@@ -981,6 +1245,27 @@ mod tests {
         assert_eq!(load_mel_filters(80).expect("80-bin").len(), 80 * 201);
         assert_eq!(load_mel_filters(128).expect("128-bin").len(), 128 * 201);
         assert!(load_mel_filters(64).is_err());
+    }
+
+    #[test]
+    fn temperature_fallback_options_default_correctly() {
+        let opts = TranscribeOptions::default();
+        assert_eq!(opts.temperature, 0.0);
+        assert_eq!(opts.max_temperature_retries, 5);
+        assert!((opts.temperature_increment - 0.2).abs() < 1e-6);
+        assert!((opts.no_speech_threshold - 0.6).abs() < 1e-6);
+        assert!(opts.compression_ratio_threshold > 0.0);
+    }
+
+    #[test]
+    fn compression_ratio_detects_repetition() {
+        // Pure repetition collapses to one unique character → tiny
+        // ratio (1/10).
+        assert!(compression_ratio("aaaaaaaaaa") < 0.5);
+        // Normal multi-word text has many distinct characters → large ratio.
+        assert!(compression_ratio("Hello world") > 0.5);
+        // Empty input is well-defined.
+        assert_eq!(compression_ratio(""), 0.0);
     }
 
     #[test]

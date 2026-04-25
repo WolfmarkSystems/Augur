@@ -10,3 +10,4 @@ description = "Tesseract OCR for images (stub in Sprint 1)."
 verify-core = { path = "../verify-core" }
 log = { workspace = true }
 thiserror = { workspace = true }
+pdf-extract = "0.10.0"

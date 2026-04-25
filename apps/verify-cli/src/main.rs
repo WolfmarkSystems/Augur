@@ -13,10 +13,10 @@ use verify_core::pipeline::{
     detect_input_kind, BatchFileResult, BatchResult, BatchSegment, PipelineInput,
 };
 use verify_core::VerifyError;
-use verify_ocr::{iso_to_tesseract, OcrEngine};
+use verify_ocr::{extract_pdf_text, iso_to_tesseract, OcrEngine};
 use verify_stt::{
     extract_audio_from_video, ModelManager as WhisperModelManager, SttEngine, SttResult,
-    SttSegment, WhisperPreset,
+    SttSegment, TranscribeOptions, WhisperPreset,
 };
 use verify_translate::{
     Backend as TranslationBackend, TranslationEngine, TranslationResult,
@@ -56,15 +56,17 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
 
-    /// Language-identification backend. fastText = 176 languages
-    /// (requires one-time `lid.176.ftz` model download on first
-    /// run); whichlang = 16 major languages, pure-Rust, no model
-    /// download, no network at all.
+    /// Language-identification backend.
     ///
-    /// Defaults to fastText with automatic fallback to whichlang
-    /// when the fastText model has not been cached and the
-    /// current run cannot reach the network.
-    #[arg(long, value_enum, default_value_t = ClassifierBackend::Fasttext, global = true)]
+    /// `whichlang` (default, production) — 16 major languages,
+    /// pure-Rust, embedded weights, no network, no model download.
+    ///
+    /// `fasttext` — EXPERIMENTAL. The `fasttext = "0.8.0"` crate
+    /// is not binary-compatible with `lid.176.ftz` and produces
+    /// systematically wrong classifications (Arabic → Esperanto,
+    /// etc — see Sprint 1 diagnostic probe). DO NOT use for
+    /// casework. Kept for research evaluation only.
+    #[arg(long, value_enum, default_value_t = ClassifierBackend::Whichlang, global = true)]
     classifier_backend: ClassifierBackend,
 
     /// Translation backend.
@@ -125,6 +127,18 @@ enum Command {
         /// Whisper model preset: fast / balanced / accurate.
         #[arg(long, value_enum, default_value_t = CliPreset::Balanced)]
         preset: CliPreset,
+
+        /// Initial decoding temperature. `0.0` is greedy (default).
+        /// Higher values introduce sampling and are used by the
+        /// retry loop on hard audio.
+        #[arg(long, default_value_t = 0.0)]
+        temperature: f32,
+
+        /// Maximum number of *additional* temperature retries on
+        /// segments that look like hallucinations (per OpenAI's
+        /// reference). Each retry bumps temperature by 0.2.
+        #[arg(long, default_value_t = 5)]
+        max_retries: u8,
     },
 
     /// Full pipeline: classify → (STT/OCR if needed) → translate.
@@ -254,7 +268,12 @@ fn run(
 ) -> Result<(), VerifyError> {
     match command {
         Command::Classify { text, target } => cmd_classify(&text, &target, backend),
-        Command::Transcribe { input, preset } => cmd_transcribe(&input, preset.into()),
+        Command::Transcribe {
+            input,
+            preset,
+            temperature,
+            max_retries,
+        } => cmd_transcribe(&input, preset.into(), temperature, max_retries),
         Command::Translate {
             input,
             text,
@@ -314,8 +333,19 @@ fn cmd_classify(
 
 // ── transcribe ───────────────────────────────────────────────────
 
-fn cmd_transcribe(input: &std::path::Path, preset: WhisperPreset) -> Result<(), VerifyError> {
-    let result = try_run_stt(input, preset)?;
+fn cmd_transcribe(
+    input: &std::path::Path,
+    preset: WhisperPreset,
+    temperature: f32,
+    max_retries: u8,
+) -> Result<(), VerifyError> {
+    let options = TranscribeOptions {
+        preset,
+        temperature,
+        max_temperature_retries: max_retries,
+        ..TranscribeOptions::default()
+    };
+    let result = try_run_stt_with(input, &options)?;
     println_verify(format!(
         "Language detected: {} (confidence: {:.2})",
         result.detected_language, result.confidence
@@ -519,6 +549,10 @@ fn resolve_path_input(
             // should pass `--image` + `--ocr-lang`.
             resolve_image_input(&p, "en")
         }
+        PipelineInput::Pdf(p) => {
+            println_verify("Input type: PDF — extracting text layer (OCR fallback if scanned)...");
+            resolve_pdf_input(&p, "en")
+        }
         PipelineInput::Text(_) => {
             // detect_input_kind never returns Text from a path —
             // it falls back to Audio. This arm exists only to keep
@@ -528,6 +562,21 @@ fn resolve_path_input(
             ))
         }
     }
+}
+
+fn resolve_pdf_input(
+    pdf: &std::path::Path,
+    ocr_lang: &str,
+) -> Result<ResolvedSource, VerifyError> {
+    let scratch = std::env::temp_dir().join("verify").join("pdf-scratch");
+    let text = extract_pdf_text(pdf, &scratch, ocr_lang)?;
+    Ok(ResolvedSource {
+        text,
+        upstream_lang: ocr_lang.to_string(),
+        upstream_confidence: 0.0,
+        segments: None,
+        kind_label: "pdf",
+    })
 }
 
 fn resolve_image_input(
@@ -606,18 +655,21 @@ fn cmd_batch(
     let mut audio_count = 0u32;
     let mut video_count = 0u32;
     let mut image_count = 0u32;
+    let mut pdf_count = 0u32;
     let mut other_count = 0u32;
     for f in &files {
         match detect_input_kind(f) {
             PipelineInput::Audio(_) => audio_count += 1,
             PipelineInput::Video(_) => video_count += 1,
             PipelineInput::Image(_) => image_count += 1,
+            PipelineInput::Pdf(_) => pdf_count += 1,
             PipelineInput::Text(_) => other_count += 1,
         }
     }
     println_verify(format!("Batch processing: {input:?}"));
     println_verify(format!(
-        "Found {} files ({audio_count} audio, {video_count} video, {image_count} image{}{})",
+        "Found {} files ({audio_count} audio, {video_count} video, {image_count} image, \
+         {pdf_count} pdf{}{})",
         files.len(),
         if other_count > 0 { ", " } else { "" },
         if other_count > 0 {
@@ -640,6 +692,7 @@ fn cmd_batch(
             PipelineInput::Audio(_) => "audio",
             PipelineInput::Video(_) => "video",
             PipelineInput::Image(_) => "image",
+            PipelineInput::Pdf(_) => "pdf",
             PipelineInput::Text(_) => "text",
         };
         if let Some(allow) = &allowed {
@@ -746,6 +799,7 @@ fn process_one_file(
     let resolved = match kind_label {
         "audio" | "video" => resolve_path_input(file, preset)?,
         "image" => resolve_image_input(file, ocr_lang)?,
+        "pdf" => resolve_pdf_input(file, ocr_lang)?,
         other => {
             return Err(VerifyError::InvalidInput(format!(
                 "batch: unsupported input kind {other:?} for {file:?}"
@@ -897,6 +951,17 @@ fn build_fasttext() -> Result<LanguageClassifier, VerifyError> {
 }
 
 fn try_run_stt(input: &std::path::Path, preset: WhisperPreset) -> Result<SttResult, VerifyError> {
+    let options = TranscribeOptions {
+        preset,
+        ..TranscribeOptions::default()
+    };
+    try_run_stt_with(input, &options)
+}
+
+fn try_run_stt_with(
+    input: &std::path::Path,
+    options: &TranscribeOptions,
+) -> Result<SttResult, VerifyError> {
     // Validate the audio file BEFORE touching the network. An
     // examiner who types a wrong path should not accidentally
     // trigger a 150 MB / 290 MB / 3 GB Whisper download. This
@@ -907,9 +972,9 @@ fn try_run_stt(input: &std::path::Path, preset: WhisperPreset) -> Result<SttResu
         )));
     }
     let mgr = WhisperModelManager::with_xdg_cache()?;
-    let paths = mgr.ensure_whisper_model(preset)?;
-    let mut engine = SttEngine::load(&paths, preset)?;
-    engine.transcribe(input)
+    let paths = mgr.ensure_whisper_model(options.preset)?;
+    let mut engine = SttEngine::load(&paths, options.preset)?;
+    engine.transcribe_with_options(input, options)
 }
 
 /// Small helper so every CLI line uses the `[VERIFY]` prefix
@@ -920,4 +985,40 @@ fn try_run_stt(input: &std::path::Path, preset: WhisperPreset) -> Result<SttResu
 /// one place a reviewer can audit.
 fn println_verify<S: AsRef<str>>(line: S) {
     println!("[VERIFY] {}", line.as_ref());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn default_classifier_backend_is_whichlang() {
+        // Sprint 4 P1: fasttext 0.8 is binary-incompatible with
+        // lid.176.ftz; whichlang must be the default backend.
+        let cli = Cli::parse_from(["verify", "classify", "--text", "x"]);
+        assert!(matches!(cli.classifier_backend, ClassifierBackend::Whichlang));
+    }
+
+    #[test]
+    fn fasttext_backend_still_selectable_for_research() {
+        let cli = Cli::parse_from([
+            "verify",
+            "--classifier-backend",
+            "fasttext",
+            "classify",
+            "--text",
+            "x",
+        ]);
+        assert!(matches!(cli.classifier_backend, ClassifierBackend::Fasttext));
+    }
+
+    #[test]
+    fn default_translation_backend_is_auto() {
+        let cli = Cli::parse_from(["verify", "classify", "--text", "x"]);
+        assert!(matches!(
+            cli.translation_backend,
+            CliTranslationBackend::Auto
+        ));
+    }
 }

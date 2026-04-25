@@ -282,10 +282,74 @@ opt-in API.
 
 ## What remains for Sprint 4+
 
-- Whisper temperature-fallback decoding + full timestamp rules
-  (Sprint 2 ships greedy + suppress_tokens).
 - Speaker diarization (who said what).
-- PDF text extraction.
 - Real-time transcription (post-v1.0).
-- Live ctranslate2 benchmark on a machine with both transformers
-  and ctranslate2 fully installed.
+
+## Sprint 4 decisions (shipped 2026-04-25)
+
+- **whichlang is now the production default classifier.** Sprint 1
+  diagnostic (`crates/verify-classifier/examples/lid_label_probe.rs`,
+  feature-gated as `fasttext-probe`) confirmed the
+  `fasttext = "0.8.0"` crate is NOT binary-compatible with
+  Meta's published `lid.176.ftz`: Arabic classifies as
+  `__label__eo` (Esperanto), Russian / Persian / Chinese drift
+  similarly. The wire format the crate parses does not match
+  `.ftz`'s actual layout, so labels and weights deserialize out
+  of alignment. The CLI's `--classifier-backend` defaults to
+  `whichlang` (16 languages, embedded weights, no network);
+  `fasttext` is now flagged EXPERIMENTAL on `--help`,
+  `load_fasttext()` warns on every call, and the diagnostic
+  example is committed as feature-gated. Sprint 5 evaluates
+  `fasttext-pure-rs` as a 176-language replacement.
+- **Whisper temperature fallback (per-segment).** New
+  `verify_stt::TranscribeOptions` exposes the standard OpenAI
+  parameters (`temperature`, `temperature_increment`,
+  `max_temperature_retries`, `no_speech_threshold`,
+  `compression_ratio_threshold`, `rng_seed`). Each 30-second mel
+  chunk is decoded; if `no_speech_prob > no_speech_threshold`
+  the chunk is accepted as silence, else if the unique-character
+  ratio of the produced text falls below
+  `compression_ratio_threshold` the chunk is re-decoded at the
+  next temperature step (sampling from `softmax(logits/T)`
+  instead of argmax). The `rng_seed` default is fixed for
+  forensic reproducibility — same audio + same seed produces
+  identical transcripts. CLI: `verify transcribe --temperature
+  0.0 --max-retries 5`.
+- **PDF input** auto-routed by extension. New
+  `verify_ocr::extract_pdf_text` tries the pure-Rust
+  `pdf-extract` text layer first (handles digitally-generated
+  PDFs with no system deps); falls back to a `pdftoppm` (poppler)
+  rasterize step + per-page Tesseract OCR for scanned PDFs.
+  Missing `pdftoppm` returns a clear `VerifyError::Ocr` with the
+  install hint. PDFs flow through the standard
+  classifier → NLLB pipeline; `verify batch --types audio,video,image,pdf`
+  honors them.
+- **ctranslate2 benchmark (M1 Max, NLLB-200-distilled-600M, INT8).**
+  Same 98-word forensic-style Arabic paragraph
+  (`tests/fixtures/arabic_100_words.txt`) translated through both
+  bundled worker scripts:
+
+  | Backend       | Warm time | Cold time (incl. conversion) |
+  | ------------- | --------- | ----------------------------- |
+  | transformers  | 19.15 s   | 150.78 s                      |
+  | ctranslate2   |  6.73 s   |  11.33 s (conversion ≈ 4 s)   |
+
+  **Speedup: 2.85× warm.** Output quality is equivalent — both
+  produce fluent English with consistent terminology
+  ("investigation team", "scene of the accident", "northern
+  suburbs", etc). `Backend::Auto` was kept as: prefer ct2 when
+  `<hf_cache>/ct2/` exists, else transformers. Fresh installs
+  pay the transformers cost on the first call; once an examiner
+  runs `--translation-backend ct2` once, the converted model is
+  cached and `Auto` picks it forever after. The reproducer
+  script is checked in at `tests/run_benchmark.py`.
+
+## What remains for Sprint 5+
+
+- `fasttext-pure-rs` evaluation as a 176-language replacement
+  for the broken `fasttext = "0.8"` parser.
+- Speaker diarization (who said what — `pyannote.audio` or
+  comparable Rust port).
+- Real-time transcription (post-v1.0).
+- Optional auto-conversion to ct2 on first install — pay the
+  one-time cost up front for the 2.85× steady-state speedup.

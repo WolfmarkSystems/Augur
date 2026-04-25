@@ -37,6 +37,10 @@ pub enum PipelineInput {
     /// Sprint 3: video files (mp4, mov, avi, mkv, m4v, wmv, webm, 3gp).
     /// The CLI extracts audio via ffmpeg before handing off to STT.
     Video(PathBuf),
+    /// Sprint 4: PDF documents. The CLI extracts text via the
+    /// `pdf-extract` text layer; falls back to rasterize-and-OCR
+    /// (poppler `pdftoppm` + Tesseract) for scanned PDFs.
+    Pdf(PathBuf),
 }
 
 /// Auto-detect the pipeline input kind from a file path's extension.
@@ -58,6 +62,7 @@ pub fn detect_input_kind(path: &Path) -> PipelineInput {
         | Some("wmv") | Some("webm") | Some("3gp") => PipelineInput::Video(path.to_path_buf()),
         Some("png") | Some("jpg") | Some("jpeg") | Some("tiff") | Some("tif")
         | Some("bmp") | Some("gif") => PipelineInput::Image(path.to_path_buf()),
+        Some("pdf") => PipelineInput::Pdf(path.to_path_buf()),
         _ => PipelineInput::Audio(path.to_path_buf()),
     }
 }
@@ -218,6 +223,18 @@ mod tests {
         let _ = PipelineInput::Audio(PathBuf::from("a.wav"));
         let _ = PipelineInput::Image(PathBuf::from("p.png"));
         let _ = PipelineInput::Video(PathBuf::from("v.mp4"));
+        let _ = PipelineInput::Pdf(PathBuf::from("d.pdf"));
+    }
+
+    #[test]
+    fn pdf_input_detected_by_extension() {
+        for ext in &["pdf", "PDF"] {
+            let p = PathBuf::from(format!("doc.{ext}"));
+            assert!(
+                matches!(detect_input_kind(&p), PipelineInput::Pdf(_)),
+                "expected Pdf for .{ext}"
+            );
+        }
     }
 
     #[test]

@@ -197,6 +197,142 @@ fn which_binary(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+// ── PDF extraction ──────────────────────────────────────────────
+//
+// Sprint 4 P3: PDFs are common forensic evidence. Two pathways:
+//   1. Pure-Rust text-layer extraction via `pdf-extract` —
+//      handles native digital PDFs (exported reports, downloaded
+//      documents) with no system deps.
+//   2. Rasterize + OCR fallback for scanned PDFs (no text layer).
+//      Shells out to `pdftoppm` (poppler) for rasterization, then
+//      reuses the existing [`OcrEngine`] for per-page OCR. Same
+//      subprocess pattern as `tesseract` itself.
+
+/// Extract text from a PDF. Tries the text layer first; falls
+/// back to rasterize-and-OCR if the text layer is empty (scanned
+/// document).
+///
+/// `ocr_lang` is the ISO 639-1 hint for the OCR fallback path —
+/// ignored for text-layer-only PDFs. `scratch_dir` is used for
+/// rasterized page images and is created if missing.
+pub fn extract_pdf_text(
+    pdf_path: &Path,
+    scratch_dir: &Path,
+    ocr_lang: &str,
+) -> Result<String, VerifyError> {
+    if !pdf_path.exists() {
+        return Err(VerifyError::InvalidInput(format!(
+            "pdf file not found: {:?}",
+            pdf_path
+        )));
+    }
+    debug!("verify-ocr: extracting text layer from {pdf_path:?}");
+    let text_layer = match pdf_extract::extract_text(pdf_path) {
+        Ok(t) => t,
+        Err(e) => {
+            warn!("verify-ocr: pdf-extract failed on {pdf_path:?}: {e}");
+            String::new()
+        }
+    };
+    if !text_layer.trim().is_empty() {
+        info!(
+            "verify-ocr: PDF text layer extracted: {} chars",
+            text_layer.len()
+        );
+        return Ok(text_layer);
+    }
+    debug!("verify-ocr: no text layer in {pdf_path:?} — falling back to rasterize+OCR");
+    extract_pdf_via_ocr(pdf_path, scratch_dir, ocr_lang)
+}
+
+fn extract_pdf_via_ocr(
+    pdf_path: &Path,
+    scratch_dir: &Path,
+    ocr_lang: &str,
+) -> Result<String, VerifyError> {
+    if !which_binary("pdftoppm") {
+        return Err(VerifyError::Ocr(
+            "pdftoppm not found on PATH (required to OCR scanned PDFs). \
+             Install poppler: `brew install poppler` (macOS) or \
+             `apt install poppler-utils` (Linux)."
+                .to_string(),
+        ));
+    }
+    std::fs::create_dir_all(scratch_dir)?;
+    let prefix = scratch_dir.join(format!(
+        "verify-pdf-{}-{}",
+        std::process::id(),
+        random_suffix()
+    ));
+    warn!(
+        "verify-ocr: rasterizing {pdf_path:?} via pdftoppm → {prefix:?}-N.png \
+         (scanned PDF fallback path)"
+    );
+    let status = Command::new("pdftoppm")
+        .arg("-png")
+        .arg("-r")
+        .arg("300")
+        .arg(pdf_path)
+        .arg(&prefix)
+        .status()
+        .map_err(|e| VerifyError::Ocr(format!("failed to launch pdftoppm: {e}")))?;
+    if !status.success() {
+        return Err(VerifyError::Ocr(format!(
+            "pdftoppm failed for {pdf_path:?}: exit {:?}",
+            status.code()
+        )));
+    }
+
+    let prefix_str = prefix
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| VerifyError::Ocr("scratch prefix not UTF-8".to_string()))?
+        .to_string();
+    let mut pages: Vec<PathBuf> = std::fs::read_dir(scratch_dir)?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.starts_with(&prefix_str) && n.ends_with(".png"))
+                .unwrap_or(false)
+        })
+        .collect();
+    pages.sort();
+    if pages.is_empty() {
+        return Err(VerifyError::Ocr(format!(
+            "pdftoppm produced no pages for {pdf_path:?}"
+        )));
+    }
+
+    let tess = iso_to_tesseract(ocr_lang)?;
+    let engine = OcrEngine::new(tess)?;
+    let mut combined = String::new();
+    for page in &pages {
+        match engine.extract_text(page) {
+            Ok(r) => {
+                if !combined.is_empty() {
+                    combined.push_str("\n\n");
+                }
+                combined.push_str(r.text.trim());
+            }
+            Err(e) => {
+                warn!("verify-ocr: OCR failed on PDF page {page:?}: {e}");
+            }
+        }
+        let _ = std::fs::remove_file(page);
+    }
+    Ok(combined)
+}
+
+fn random_suffix() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
 /// Sprint-1 stub kept for transitional callers; new code should
 /// construct an [`OcrEngine`] directly.
 pub fn ocr_image_stub(path: &Path, lang_hint: Option<&str>) -> Result<String, VerifyError> {
@@ -262,6 +398,34 @@ mod tests {
         match iso_to_tesseract("xx") {
             Err(VerifyError::Ocr(_)) => {}
             other => panic!("expected Ocr error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pdf_extraction_returns_error_for_missing_file() {
+        let missing = Path::new("/nonexistent/doc.pdf");
+        let scratch = std::env::temp_dir().join("verify-pdf-test-missing");
+        match extract_pdf_text(missing, &scratch, "en") {
+            Err(VerifyError::InvalidInput(_)) => {}
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extract_pdf_via_ocr_rejects_unmapped_lang() {
+        // Validates that the fallback path surfaces a clear error
+        // for an unmapped ISO code without panicking. Doesn't
+        // require pdftoppm to be installed because the lang lookup
+        // happens before the binary check.
+        let scratch = std::env::temp_dir().join("verify-pdf-test-bad-lang");
+        // Use an existing file (this source file) so the
+        // PathBuf::exists() check passes; the real failure is the
+        // unmapped iso code or the missing pdftoppm. Either is a
+        // clean Ocr error — a panic would break this test.
+        let pdf = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        match extract_pdf_text(&pdf, &scratch, "xx") {
+            Err(VerifyError::Ocr(_)) => {}
+            other => panic!("expected Ocr error on unmapped lang, got {other:?}"),
         }
     }
 

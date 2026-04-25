@@ -2,29 +2,31 @@
 //!
 //! Two backends live behind a single `LanguageClassifier` enum:
 //!
-//! * **fastText** (`fasttext` crate, 0.8.0) — the production backend.
-//!   Uses the Meta `lid.176.ftz` LID model (176 languages, ~900 KB)
-//!   downloaded on first run via [`ModelManager::ensure_lid_model`].
-//!   fastText 0.8 is a *pure-Rust* reimplementation — no FFI, no
-//!   system libs, builds clean on macOS ARM64 in ~5s. Chosen per
-//!   the Sprint 1 P2 decision rule (try fasttext first; fall back
-//!   to whichlang only on FFI / build problems).
+//! * **whichlang** (`whichlang` crate, 0.1.1) — **the production
+//!   default since Sprint 4.** Pure-Rust, embedded weights, no
+//!   model download, no network. Covers 16 major languages (ISO
+//!   639-3 codes mapped to 639-1 here). Construct via
+//!   [`LanguageClassifier::new_whichlang`].
 //!
-//! * **whichlang** (`whichlang` crate, 0.1.1) — pure-Rust, embedded
-//!   weights, no model download required, no network. Covers 16
-//!   major languages (ISO 639-3 codes mapped to 639-1 here). This
-//!   is the **offline test backend** — unit tests construct the
-//!   classifier via [`LanguageClassifier::new_whichlang`] so they
-//!   pass without ever touching the filesystem model cache. It is
-//!   also the correct fallback for air-gapped deployments that
-//!   cannot reach the Facebook mirror for first-run download;
-//!   Sprint 2 will expose a `--classifier-backend whichlang` CLI
-//!   flag to surface this to examiners.
+//! * **fastText** (`fasttext` crate, 0.8.0) — **EXPERIMENTAL**.
+//!   The `fasttext = "0.8.0"` crate is NOT binary-compatible with
+//!   Meta's published `lid.176.ftz` model. Sprint 1's diagnostic
+//!   probe (see `examples/lid_label_probe.rs`) confirmed
+//!   systematically wrong classifications: Arabic → `__label__eo`
+//!   (Esperanto), and similar drift on Russian / Chinese / Persian.
+//!   The wire format the crate parses does not match the format
+//!   the `.ftz` file actually uses, so labels and weights are
+//!   read out of alignment. **Do NOT use this backend for
+//!   production casework.** Kept for research evaluation only;
+//!   Sprint 5 evaluates `fasttext-pure-rs` as a 176-language
+//!   replacement that actually parses the `.ftz` correctly.
 //!
-//! The only network egress in VERIFY's default code path is
-//! [`ModelManager::ensure_lid_model`]'s first-run fetch of
-//! `lid.176.ftz` via a `curl` subprocess. Every subsequent run
-//! returns the cached path.
+//! The fastText network egress
+//! ([`ModelManager::ensure_lid_model`]) is still defined here so
+//! the audit-trail is complete and so a researcher can opt in
+//! manually, but it is no longer reached on the default code
+//! path. The whichlang backend never touches the filesystem or
+//! the network.
 
 use fasttext::FastText;
 use log::{debug, warn};
@@ -188,9 +190,22 @@ enum Backend {
 }
 
 impl LanguageClassifier {
-    /// Load a fastText LID model from disk. Pair with
-    /// [`ModelManager::ensure_lid_model`] to get the path.
+    /// **EXPERIMENTAL** — load a fastText LID model from disk.
+    ///
+    /// The `fasttext = "0.8.0"` crate is NOT binary-compatible with
+    /// Facebook's published `lid.176.ftz` model. It produces
+    /// systematically wrong classifications (Arabic → Esperanto,
+    /// Persian → Latin, etc). Use [`LanguageClassifier::new_whichlang`]
+    /// for production work; this entry point is kept for research
+    /// evaluation only. See `examples/lid_label_probe.rs` for the
+    /// diagnostic that confirmed the incompatibility.
     pub fn load_fasttext(model_path: &Path) -> Result<Self, VerifyError> {
+        warn!(
+            "load_fasttext: backend is EXPERIMENTAL. The fasttext 0.8 crate is \
+             not binary-compatible with lid.176.ftz and produces systematically \
+             wrong classifications. Prefer LanguageClassifier::new_whichlang for \
+             production casework."
+        );
         let model = FastText::load_model(model_path).map_err(|e| {
             VerifyError::Classifier(format!(
                 "fasttext::load_model({model_path:?}) failed: {e}"

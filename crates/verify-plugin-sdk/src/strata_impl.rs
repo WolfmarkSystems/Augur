@@ -33,7 +33,7 @@ use strata_plugin_sdk::{
 };
 use verify_classifier::LanguageClassifier;
 use verify_core::pipeline::{detect_input_kind, PipelineInput};
-use verify_ocr::{iso_to_tesseract, OcrEngine};
+use verify_ocr::{extract_pdf_text, iso_to_tesseract, OcrEngine};
 use verify_stt::{
     extract_audio_from_video, ModelManager as WhisperModelManager, SttEngine, SttResult,
     WhisperPreset,
@@ -288,6 +288,7 @@ fn process_one_file(
         PipelineInput::Audio(_) => resolve_audio(file)?,
         PipelineInput::Video(_) => resolve_video(file)?,
         PipelineInput::Image(_) => resolve_image(file, target)?,
+        PipelineInput::Pdf(_) => resolve_pdf(file, target)?,
         PipelineInput::Text(_) => return Ok(None),
     };
     if resolved.text.trim().is_empty() {
@@ -345,6 +346,18 @@ fn resolve_video(file: &Path) -> Result<ResolvedSource, String> {
         text: stt.transcript,
         upstream_lang: stt.detected_language,
         segments: Some(stt.segments),
+    })
+}
+
+fn resolve_pdf(file: &Path, ocr_lang: &str) -> Result<ResolvedSource, String> {
+    let scratch = std::env::temp_dir()
+        .join("verify")
+        .join("strata-pdf-scratch");
+    let text = extract_pdf_text(file, &scratch, ocr_lang).map_err(|e| e.to_string())?;
+    Ok(ResolvedSource {
+        text,
+        upstream_lang: ocr_lang.to_string(),
+        segments: None,
     })
 }
 
