@@ -10,21 +10,23 @@ description = "Language identification router. whichlang = production; fasttext 
 verify-core = { path = "../verify-core" }
 log = { workspace = true }
 thiserror = { workspace = true }
-# whichlang is the production backend (16 major languages, pure
-# Rust, no model download). fasttext 0.8 is kept for research
-# evaluation only — Sprint 1 confirmed it is NOT binary-compatible
-# with Facebook's `lid.176.ftz` and produces systematically wrong
-# classifications (Arabic → Esperanto). See CLAUDE.md "Known
-# limitations" + the `lid_label_probe` example below.
-fasttext = "0.8"
+# Sprint 5 P1: `fasttext-pure-rs` is binary-compatible with
+# Meta's `lid.176.ftz` (Arabic / Chinese / Russian / Spanish /
+# Persian / Urdu all classify correctly). It REPLACES the
+# broken `fasttext = 0.8.0` crate that Sprints 1-4 carried.
+# `whichlang` remains the production default (16 major languages,
+# embedded weights, no network); fasttext-pure-rs is opt-in via
+# `--classifier-backend fasttext` for 176-language coverage on
+# workstations that can fetch the LID model once.
+fasttext-pure-rs = "0.1.0"
 whichlang = "0.1.1"
 
 [[example]]
-name = "lid_label_probe"
-# Feature-gated so the diagnostic does not run as part of a normal
-# `cargo build` / `cargo check`. To reproduce the Sprint 1 finding:
+name = "lid_pure_probe"
+# Sprint 5 P1 — confirms `fasttext-pure-rs` reads `lid.176.ftz`
+# correctly. Reproduce:
 #   cargo run -p verify-classifier --features fasttext-probe \
-#     --example lid_label_probe
+#     --example lid_pure_probe
 required-features = ["fasttext-probe"]
 
 [features]

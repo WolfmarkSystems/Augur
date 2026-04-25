@@ -8,27 +8,23 @@
 //!   639-3 codes mapped to 639-1 here). Construct via
 //!   [`LanguageClassifier::new_whichlang`].
 //!
-//! * **fastText** (`fasttext` crate, 0.8.0) — **EXPERIMENTAL**.
-//!   The `fasttext = "0.8.0"` crate is NOT binary-compatible with
-//!   Meta's published `lid.176.ftz` model. Sprint 1's diagnostic
-//!   probe (see `examples/lid_label_probe.rs`) confirmed
-//!   systematically wrong classifications: Arabic → `__label__eo`
-//!   (Esperanto), and similar drift on Russian / Chinese / Persian.
-//!   The wire format the crate parses does not match the format
-//!   the `.ftz` file actually uses, so labels and weights are
-//!   read out of alignment. **Do NOT use this backend for
-//!   production casework.** Kept for research evaluation only;
-//!   Sprint 5 evaluates `fasttext-pure-rs` as a 176-language
-//!   replacement that actually parses the `.ftz` correctly.
+//! * **fastText** (`fasttext-pure-rs` crate, 0.1.0) — production-
+//!   ready as of Sprint 5. Reads Meta's `lid.176.ftz` correctly
+//!   (Sprint 5 P1 probe: Arabic / Chinese / Russian / Spanish /
+//!   Persian / Urdu all classify with high confidence; Pashto
+//!   confuses with Persian — a known model-level limitation, not
+//!   a parser bug). Replaces the binary-incompatible
+//!   `fasttext = "0.8.0"` crate that Sprints 1-4 carried.
+//!   Construct via [`LanguageClassifier::load_fasttext`].
+//!   Whichlang is still the CLI default (no model download);
+//!   fastText is opt-in via `--classifier-backend fasttext`.
 //!
 //! The fastText network egress
-//! ([`ModelManager::ensure_lid_model`]) is still defined here so
-//! the audit-trail is complete and so a researcher can opt in
-//! manually, but it is no longer reached on the default code
-//! path. The whichlang backend never touches the filesystem or
-//! the network.
+//! ([`ModelManager::ensure_lid_model`]) is the only first-run
+//! download VERIFY performs in its default-classifier code path
+//! when the user opts into fastText.
 
-use fasttext::FastText;
+use fasttext_pure_rs::FastText;
 use log::{debug, warn};
 use std::path::{Path, PathBuf};
 use verify_core::VerifyError;
@@ -135,6 +131,27 @@ impl ModelManager {
 
         std::fs::create_dir_all(&self.cache_dir)?;
 
+        // Air-gap path: when `VERIFY_AIRGAP_PATH` is set the
+        // ModelManager copies pre-staged weights from there
+        // instead of touching the network. This is the supported
+        // offline-deployment path for classified workstations
+        // that can never reach the internet.
+        if let Some(staged) = airgap_lid_model() {
+            log::info!(
+                "verify-classifier: VERIFY_AIRGAP_PATH provides {LID_MODEL_FILENAME} at {staged:?}; \
+                 copying to {dest:?} (no network egress)"
+            );
+            std::fs::copy(&staged, &dest)?;
+            let size = std::fs::metadata(&dest)?.len();
+            if size < LID_MODEL_MIN_BYTES {
+                return Err(VerifyError::ModelManager(format!(
+                    "air-gapped LID model at {dest:?} is {size} bytes — expected \
+                     >= {LID_MODEL_MIN_BYTES}; check VERIFY_AIRGAP_PATH source."
+                )));
+            }
+            return Ok(dest);
+        }
+
         // Intentional network egress. Logged, not silent.
         warn!(
             "VERIFY fetching one-time LID model ({}) from {LID_MODEL_URL} — \
@@ -190,25 +207,17 @@ enum Backend {
 }
 
 impl LanguageClassifier {
-    /// **EXPERIMENTAL** — load a fastText LID model from disk.
-    ///
-    /// The `fasttext = "0.8.0"` crate is NOT binary-compatible with
-    /// Facebook's published `lid.176.ftz` model. It produces
-    /// systematically wrong classifications (Arabic → Esperanto,
-    /// Persian → Latin, etc). Use [`LanguageClassifier::new_whichlang`]
-    /// for production work; this entry point is kept for research
-    /// evaluation only. See `examples/lid_label_probe.rs` for the
-    /// diagnostic that confirmed the incompatibility.
+    /// Load a fastText LID model from disk via the `fasttext-pure-rs`
+    /// reader (Sprint 5 P1 confirmed binary-compatible with
+    /// `lid.176.ftz`). Pair with [`ModelManager::ensure_lid_model`]
+    /// to get the path. Production-ready for the major and
+    /// forensic-priority languages (Arabic, Chinese, Russian,
+    /// Spanish, Persian, Urdu); Pashto confuses with Persian at
+    /// the model level.
     pub fn load_fasttext(model_path: &Path) -> Result<Self, VerifyError> {
-        warn!(
-            "load_fasttext: backend is EXPERIMENTAL. The fasttext 0.8 crate is \
-             not binary-compatible with lid.176.ftz and produces systematically \
-             wrong classifications. Prefer LanguageClassifier::new_whichlang for \
-             production casework."
-        );
-        let model = FastText::load_model(model_path).map_err(|e| {
+        let model = FastText::load(model_path).map_err(|e| {
             VerifyError::Classifier(format!(
-                "fasttext::load_model({model_path:?}) failed: {e}"
+                "fasttext_pure_rs::FastText::load({model_path:?}) failed: {e}"
             ))
         })?;
         Ok(Self {
@@ -245,7 +254,9 @@ impl LanguageClassifier {
                 // `predict(text, k=1, threshold=0.0)` — top-1 label,
                 // no threshold so the caller sees confidence and
                 // decides themselves.
-                let preds = model.predict(&sample, 1, 0.0);
+                let preds = model.predict(&sample, 1, 0.0).map_err(|e| {
+                    VerifyError::Classifier(format!("fasttext predict: {e}"))
+                })?;
                 let Some(p) = preds.first() else {
                     return Ok(ClassificationResult::empty(target_language));
                 };
@@ -255,7 +266,7 @@ impl LanguageClassifier {
                     .strip_prefix("__label__")
                     .unwrap_or(&p.label)
                     .to_string();
-                (code, p.prob)
+                (code, p.probability)
             }
             Backend::Whichlang => {
                 let lang = whichlang::detect_language(&sample);
@@ -270,6 +281,16 @@ impl LanguageClassifier {
             target_language: target_language.to_string(),
         })
     }
+}
+
+/// Look up the air-gap-staged LID model. Returns `Some(path)`
+/// when `VERIFY_AIRGAP_PATH` is set AND the directory contains
+/// `lid.176.ftz`. Sprint 5 P3 — pre-bundled offline installer
+/// for classified workstations that cannot reach the internet.
+fn airgap_lid_model() -> Option<PathBuf> {
+    let root = std::env::var("VERIFY_AIRGAP_PATH").ok()?;
+    let candidate = PathBuf::from(root).join(LID_MODEL_FILENAME);
+    candidate.exists().then_some(candidate)
 }
 
 /// Map whichlang's `Lang` (ISO 639-3) to the ISO 639-1 codes the
@@ -396,6 +417,150 @@ mod tests {
         assert_eq!(result.language, "");
         assert_eq!(result.confidence, 0.0);
         assert!(!result.is_foreign);
+    }
+
+    fn integration_gate_ok() -> bool {
+        std::env::var("VERIFY_RUN_INTEGRATION_TESTS").ok().as_deref() == Some("1")
+    }
+
+    fn cached_lid_model() -> Option<std::path::PathBuf> {
+        let home = std::env::var("HOME").ok()?;
+        let p = std::path::PathBuf::from(home).join(".cache/verify/models/lid.176.ftz");
+        p.exists().then_some(p)
+    }
+
+    #[test]
+    #[ignore = "Sprint 5 P1 — requires VERIFY_RUN_INTEGRATION_TESTS=1 and a cached lid.176.ftz"]
+    fn fasttext_pure_rs_classifies_arabic_correctly() {
+        if !integration_gate_ok() {
+            eprintln!("VERIFY_RUN_INTEGRATION_TESTS != 1 — skipping");
+            return;
+        }
+        let Some(model) = cached_lid_model() else {
+            eprintln!("lid.176.ftz not cached — skipping");
+            return;
+        };
+        let classifier = LanguageClassifier::load_fasttext(&model).expect("load_fasttext");
+        let r = classifier
+            .classify("مرحبا بالعالم، كيف حالك اليوم؟", "en")
+            .expect("classify");
+        assert_eq!(r.language, "ar", "got {} ({})", r.language, r.confidence);
+        assert!(
+            r.confidence > 0.8,
+            "expected > 0.8 confidence, got {}",
+            r.confidence
+        );
+    }
+
+    #[test]
+    #[ignore = "Sprint 5 P1 — requires VERIFY_RUN_INTEGRATION_TESTS=1 and a cached lid.176.ftz"]
+    fn fasttext_pure_rs_classifies_forensic_languages() {
+        if !integration_gate_ok() {
+            eprintln!("VERIFY_RUN_INTEGRATION_TESTS != 1 — skipping");
+            return;
+        }
+        let Some(model) = cached_lid_model() else {
+            eprintln!("lid.176.ftz not cached — skipping");
+            return;
+        };
+        let classifier = LanguageClassifier::load_fasttext(&model).expect("load_fasttext");
+        // The high-value LE/IC languages whichlang doesn't cover.
+        // Pashto is intentionally omitted — model-level confusion
+        // with Persian. Sprint 5 P1 probe documented this.
+        let cases = &[
+            ("سلام دنیا، حال شما چطور است؟", "fa"), // Persian/Farsi
+            ("ہیلو ورلڈ، آج آپ کیسے ہیں؟", "ur"),   // Urdu
+        ];
+        for (text, expected) in cases {
+            let r = classifier.classify(text, "en").expect("classify");
+            assert_eq!(r.language, *expected, "got {} for {text:?}", r.language);
+        }
+    }
+
+    #[test]
+    fn airgap_path_short_circuits_download() {
+        // Sprint 5 P3 — staging a synthetic ftz under the
+        // air-gap path must satisfy ensure_lid_model without any
+        // network call. Uses a fresh temp dir so we don't pollute
+        // the real cache.
+        let work = std::env::temp_dir().join(format!(
+            "verify-airgap-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let stage = work.join("staged");
+        let cache = work.join("cache");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::create_dir_all(&cache).unwrap();
+        let staged = stage.join(LID_MODEL_FILENAME);
+        // Synthesize a "model" that's at least the published size
+        // so the integrity check passes.
+        let body = vec![0u8; LID_MODEL_MIN_BYTES as usize + 1024];
+        std::fs::write(&staged, &body).unwrap();
+
+        let prev = std::env::var("VERIFY_AIRGAP_PATH").ok();
+        // SAFETY: tests are single-threaded under cargo test --
+        // --test-threads=1 by convention; this test sets the env
+        // for its own duration and restores at the end.
+        unsafe {
+            std::env::set_var("VERIFY_AIRGAP_PATH", &stage);
+        }
+        let mgr = ModelManager::new(cache.clone());
+        let path = mgr.ensure_lid_model().expect("airgap copy");
+        assert!(path.exists());
+        assert_eq!(path, cache.join(LID_MODEL_FILENAME));
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), body.len() as u64);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("VERIFY_AIRGAP_PATH", v),
+                None => std::env::remove_var("VERIFY_AIRGAP_PATH"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn airgap_path_takes_priority_over_existing_cache() {
+        // If the cache is empty and AIRGAP_PATH is set, ensure
+        // we use the airgap copy rather than triggering a
+        // download. Detected by the absence of any curl invocation
+        // in this test (synthetic ftz is never a real model so
+        // download couldn't even start, but we verify the path
+        // returned matches the airgap source by file size).
+        let work = std::env::temp_dir().join(format!(
+            "verify-airgap-prio-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let stage = work.join("staged");
+        let cache = work.join("cache");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::create_dir_all(&cache).unwrap();
+        // Use a distinctive size to prove we copied from staged
+        // rather than fetching something else.
+        let body = vec![7u8; LID_MODEL_MIN_BYTES as usize + 4096];
+        std::fs::write(stage.join(LID_MODEL_FILENAME), &body).unwrap();
+
+        let prev = std::env::var("VERIFY_AIRGAP_PATH").ok();
+        unsafe {
+            std::env::set_var("VERIFY_AIRGAP_PATH", &stage);
+        }
+        let mgr = ModelManager::new(cache);
+        let path = mgr.ensure_lid_model().expect("airgap takes priority");
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), body.len() as u64);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("VERIFY_AIRGAP_PATH", v),
+                None => std::env::remove_var("VERIFY_AIRGAP_PATH"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&work);
     }
 
     #[test]

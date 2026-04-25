@@ -15,7 +15,8 @@ use verify_core::pipeline::{
 use verify_core::VerifyError;
 use verify_ocr::{extract_pdf_text, iso_to_tesseract, OcrEngine};
 use verify_stt::{
-    extract_audio_from_video, ModelManager as WhisperModelManager, SttEngine, SttResult,
+    extract_audio_from_video, merge_stt_with_diarization, DiarizationEngine, DiarizationSegment,
+    EnrichedSegment, HfTokenManager, ModelManager as WhisperModelManager, SttEngine, SttResult,
     SttSegment, TranscribeOptions, WhisperPreset,
 };
 use verify_translate::{
@@ -58,14 +59,17 @@ struct Cli {
 
     /// Language-identification backend.
     ///
-    /// `whichlang` (default, production) — 16 major languages,
-    /// pure-Rust, embedded weights, no network, no model download.
+    /// `whichlang` (default) — 16 major languages, pure-Rust,
+    /// embedded weights, no network, no model download.
     ///
-    /// `fasttext` — EXPERIMENTAL. The `fasttext = "0.8.0"` crate
-    /// is not binary-compatible with `lid.176.ftz` and produces
-    /// systematically wrong classifications (Arabic → Esperanto,
-    /// etc — see Sprint 1 diagnostic probe). DO NOT use for
-    /// casework. Kept for research evaluation only.
+    /// `fasttext` (production-ready as of Sprint 5) — 176
+    /// languages via `fasttext-pure-rs` reading Meta's
+    /// `lid.176.ftz`. Requires a one-time ~900 KB model
+    /// download on first run. Recommended when broader language
+    /// coverage matters (forensic targets in Persian, Urdu, etc.
+    /// that whichlang does not cover). Pashto confuses with
+    /// Persian at the model level — corroborate with metadata
+    /// when the case hinges on the distinction.
     #[arg(long, value_enum, default_value_t = ClassifierBackend::Whichlang, global = true)]
     classifier_backend: ClassifierBackend,
 
@@ -175,6 +179,28 @@ enum Command {
         /// Whisper model preset.
         #[arg(long, value_enum, default_value_t = CliPreset::Balanced)]
         preset: CliPreset,
+
+        /// Enable speaker diarization (who said what). Requires
+        /// `pip3 install --user pyannote.audio` and a Hugging Face
+        /// token configured via `verify setup --hf-token`. Audio
+        /// and video inputs only — text/image/PDF are silently
+        /// unaffected. Default: off.
+        #[arg(long, default_value_t = false)]
+        diarize: bool,
+    },
+
+    /// One-time setup commands. Currently writes a Hugging Face
+    /// access token used by the optional speaker-diarization
+    /// feature (`--diarize`); the token lives at
+    /// `~/.cache/verify/hf_token` (chmod 0600 on Unix).
+    Setup {
+        /// Hugging Face access token (`hf_…`). Get one at
+        /// https://huggingface.co/settings/tokens. Accept the
+        /// pyannote model terms at
+        /// https://huggingface.co/pyannote/speaker-diarization-3.1
+        /// before first use.
+        #[arg(long)]
+        hf_token: String,
     },
 
     /// Process an entire directory of evidence files. Walks the
@@ -281,6 +307,7 @@ fn run(
             ocr_lang,
             target,
             preset,
+            diarize,
         } => cmd_translate(
             input.as_deref(),
             text.as_deref(),
@@ -290,7 +317,9 @@ fn run(
             preset.into(),
             backend,
             translation_backend,
+            diarize,
         ),
+        Command::Setup { hf_token } => cmd_setup(&hf_token),
         Command::Batch {
             input,
             target,
@@ -402,6 +431,7 @@ fn cmd_translate(
     preset: WhisperPreset,
     backend: ClassifierBackend,
     translation_backend: TranslationBackend,
+    diarize: bool,
 ) -> Result<(), VerifyError> {
     // Resolve the source text through the appropriate engine. The
     // pipelines diverge here:
@@ -409,6 +439,7 @@ fn cmd_translate(
     //   video → ffmpeg-extract → STT → classifier → NLLB
     //   image → OCR → classifier → NLLB
     //   text  → classifier → NLLB
+    let resolved_path: Option<std::path::PathBuf> = input.map(|p| p.to_path_buf());
     let resolved = match (input, text, image) {
         (Some(path), None, None) => resolve_path_input(path, preset)?,
         (None, Some(t), None) => {
@@ -456,19 +487,54 @@ fn cmd_translate(
         resolved.upstream_confidence
     ));
 
-    match (&resolved.segments, resolved.kind_label) {
-        (Some(segs), _) => {
+    // Optional diarization step. Only applies when the source had
+    // STT segments (audio / video). Text / image / PDF inputs
+    // ignore the flag entirely — there's no audio to attribute.
+    let diarization_segments: Option<Vec<DiarizationSegment>> =
+        if diarize && resolved.segments.is_some() {
+            let path = resolved_path.as_deref().ok_or_else(|| {
+                VerifyError::InvalidInput(
+                    "--diarize requires --input <audio|video>".to_string(),
+                )
+            })?;
+            Some(run_diarization(path)?)
+        } else {
+            if diarize {
+                println_verify(
+                    "--diarize ignored: input does not produce timestamped audio segments.",
+                );
+            }
+            None
+        };
+
+    match (&resolved.segments, &diarization_segments, resolved.kind_label) {
+        (Some(stt), Some(diar), _) => {
+            let merged = merge_stt_with_diarization(stt, diar);
+            println_verify(format!(
+                "Transcript ({} speaker(s) detected):",
+                count_speakers(diar)
+            ));
+            for seg in &merged {
+                let start = format_ms(seg.start_ms);
+                let end = format_ms(seg.end_ms);
+                println_verify(format!(
+                    "  [{start} - {end}] {}: {}",
+                    seg.speaker_id, seg.text
+                ));
+            }
+        }
+        (Some(stt), None, _) => {
             println_verify("Transcript:");
-            for seg in segs {
+            for seg in stt {
                 let start = format_ms(seg.start_ms);
                 let end = format_ms(seg.end_ms);
                 println_verify(format!("  [{start} - {end}] {}", seg.text));
             }
         }
-        (None, "image") => {
+        (None, _, "image") => {
             println_verify(format!("Extracted text: {}", resolved.text));
         }
-        (None, _) => {
+        (None, _, _) => {
             println_verify(format!("Source text: {}", resolved.text));
         }
     }
@@ -503,7 +569,96 @@ fn cmd_translate(
         engine.translate(&resolved.text, &lang, target)?
     };
 
-    print_translation(&translation);
+    if let (Some(diar), Some(translated)) = (&diarization_segments, &translation.segments) {
+        let enriched = build_enriched(translated, diar);
+        println_verify("Translated transcript:");
+        for seg in &enriched {
+            let start = format_ms(seg.start_ms);
+            let end = format_ms(seg.end_ms);
+            let text = seg.translated_text.as_deref().unwrap_or("");
+            println_verify(format!(
+                "  [{start} - {end}] {}: {text}",
+                seg.speaker_id
+            ));
+        }
+        print_advisory(&translation);
+    } else {
+        print_translation(&translation);
+    }
+    Ok(())
+}
+
+fn run_diarization(audio: &std::path::Path) -> Result<Vec<DiarizationSegment>, VerifyError> {
+    let engine = DiarizationEngine::with_xdg_cache()?;
+    if !engine.is_available() {
+        return Err(VerifyError::Stt(
+            "diarization unavailable: python3 missing or HF token not configured. \
+             Run `verify setup --hf-token <hf_…>` and \
+             `pip3 install --user pyannote.audio`."
+                .to_string(),
+        ));
+    }
+    println_verify("Running pyannote speaker diarization...");
+    engine.diarize(audio)
+}
+
+fn count_speakers(segments: &[DiarizationSegment]) -> usize {
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for s in segments {
+        seen.insert(&s.speaker_id);
+    }
+    seen.len()
+}
+
+fn build_enriched(
+    translated: &[verify_translate::TranslatedSegment],
+    diar: &[DiarizationSegment],
+) -> Vec<EnrichedSegment> {
+    translated
+        .iter()
+        .map(|t| {
+            let speaker = best_speaker(t.start_ms, t.end_ms, diar);
+            EnrichedSegment {
+                start_ms: t.start_ms,
+                end_ms: t.end_ms,
+                text: t.source_text.clone(),
+                speaker_id: speaker,
+                translated_text: Some(t.translated_text.clone()),
+            }
+        })
+        .collect()
+}
+
+fn best_speaker(start_ms: u64, end_ms: u64, diar: &[DiarizationSegment]) -> String {
+    let mut best: Option<(u64, &str)> = None;
+    for d in diar {
+        let lo = start_ms.max(d.start_ms);
+        let hi = end_ms.min(d.end_ms);
+        if hi <= lo {
+            continue;
+        }
+        let overlap = hi - lo;
+        match &best {
+            Some((cur, _)) if *cur >= overlap => {}
+            _ => best = Some((overlap, d.speaker_id.as_str())),
+        }
+    }
+    best.map(|(_, s)| s.to_string())
+        .unwrap_or_else(|| "UNKNOWN".to_string())
+}
+
+fn cmd_setup(token: &str) -> Result<(), VerifyError> {
+    let mgr = HfTokenManager::with_xdg_cache()?;
+    mgr.save(token)?;
+    println_verify(format!(
+        "Hugging Face token written to {:?} (chmod 0600 on Unix).",
+        mgr.token_path
+    ));
+    println_verify(
+        "Next: install pyannote (`pip3 install --user pyannote.audio`) and \
+         accept the model terms at \
+         https://huggingface.co/pyannote/speaker-diarization-3.1.",
+    );
     Ok(())
 }
 

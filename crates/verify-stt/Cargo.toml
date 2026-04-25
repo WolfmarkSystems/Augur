@@ -35,3 +35,4 @@ serde_json = "1"
 # (argmax) and never touches the RNG; only retry attempts at T>0
 # draw samples.
 rand = "0.9"
+serde = { version = "1.0.228", features = ["derive"] }

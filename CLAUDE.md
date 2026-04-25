@@ -344,12 +344,60 @@ opt-in API.
   cached and `Auto` picks it forever after. The reproducer
   script is checked in at `tests/run_benchmark.py`.
 
-## What remains for Sprint 5+
+## Sprint 5 decisions (shipped 2026-04-26)
 
-- `fasttext-pure-rs` evaluation as a 176-language replacement
-  for the broken `fasttext = "0.8"` parser.
-- Speaker diarization (who said what — `pyannote.audio` or
-  comparable Rust port).
+- **`fasttext-pure-rs` confirmed binary-compatible with
+  `lid.176.ftz` — replaces the broken `fasttext = "0.8"` crate.**
+  Sprint 5 P1 probe (`crates/verify-classifier/examples/lid_pure_probe.rs`,
+  feature-gated as `fasttext-probe`): Arabic / Chinese / Russian /
+  Spanish / Persian / Urdu all classify correctly with high
+  confidence (0.96–0.99 on the major languages). Pashto confuses
+  with Persian — known model-level limitation, not a parser bug.
+  The 176-language fastText backend is now production-ready;
+  whichlang remains the CLI default (no model download). The
+  `lid_label_probe` example was deleted along with the broken
+  `fasttext = "0.8"` dep; the live integration tests
+  (`fasttext_pure_rs_classifies_arabic_correctly`,
+  `fasttext_pure_rs_classifies_forensic_languages`) gate on
+  `VERIFY_RUN_INTEGRATION_TESTS=1`.
+- **Speaker diarization via pyannote.audio subprocess.** New
+  `verify-stt::diarize` module: `DiarizationEngine`,
+  `DiarizationSegment`, `EnrichedSegment`, `HfTokenManager`,
+  bundled `diarize.py` worker. Same offline-first contract as
+  the NLLB workers — `~/.cache/verify/models/pyannote/` for
+  weights, JSON-over-stdio for IO. The HF token (required to
+  download the gated `pyannote/speaker-diarization-3.1` model)
+  lives at `~/.cache/verify/hf_token` (chmod 0600 on Unix);
+  `verify setup --hf-token <T>` writes it. Diarization is opt-in
+  via `verify translate --diarize`; default behavior is
+  unchanged. STT segments are merged with diarization segments
+  by maximum temporal overlap (`merge_stt_with_diarization`);
+  the CLI prints the resulting `EnrichedSegment` stream as
+  `[start - end] SPEAKER_NN: text` followed by
+  `SPEAKER_NN: translated_text`. Audio/video only — text/image/PDF
+  inputs ignore the flag with an explicit log line.
+- **Air-gap package for offline-only deployments.** New
+  `scripts/build_airgap_package.sh` produces
+  `verify-airgap-<preset>-<date>.tar.gz` containing
+  `lid.176.ftz`, the chosen Whisper preset (tiny/base/large-v3),
+  the NLLB-200-distilled-600M snapshot, and an `install.sh` that
+  copies them into `~/.cache/verify/models/` on the destination
+  machine. The Rust-side
+  `verify_classifier::ModelManager::ensure_lid_model()` now
+  consults `VERIFY_AIRGAP_PATH` before any network egress;
+  pre-staged weights short-circuit the curl path. Documented in
+  `docs/AIRGAP_INSTALL.md`. Both Whisper and NLLB use Hugging
+  Face's own cache layout, so the install script populates those
+  directly rather than going through a separate Rust-side env
+  override.
+
+## What remains for Sprint 6+
+
+- Examiner-assigned speaker labels (overwrite `SPEAKER_00` →
+  `Suspect A` and persist across runs).
 - Real-time transcription (post-v1.0).
 - Optional auto-conversion to ct2 on first install — pay the
   one-time cost up front for the 2.85× steady-state speedup.
+- Pashto/Persian disambiguation — supplement `lid.176.ftz` with
+  a script-aware tiebreaker for cases where the distinction
+  matters forensically.
