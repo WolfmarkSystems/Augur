@@ -519,3 +519,40 @@ _Sprint 1 authored by: Claude (architect) + KR (approved)_
 _Execute with: claude-opus-4-7 in ~/Wolfmark/verify/ (create it first)_
 _Offline invariant is the hard architectural requirement._
 _Every network call must be documented and justified._
+
+---
+
+## Post-Sprint 1 Finding — fasttext 0.8.0 Incompatibility
+
+_Documented: 2026-04-25_
+
+### Root cause
+fasttext 0.8.0 (pure-Rust) is NOT binary-compatible with Facebook's
+published lid.176.ftz model. Systematic wrong classifications across
+all tested languages (Arabic→Esperanto, Chinese→Serbian, etc).
+The label format is correct — the bug is in the embedding matrix
+indexing against the wrong row stride or hash bucket layout.
+
+### Evidence
+Diagnostic probe `lid_label_probe.rs` confirmed: every tested language
+classifies wrong with fastText. whichlang classifies all 8 correctly
+at confidence 1.00.
+
+### Sprint 2 actions
+1. Flip --classifier-backend default from fasttext to whichlang
+2. Mark fasttext backend as experimental in CLAUDE.md and clap docs
+3. Commit lid_label_probe.rs as a non-default [[example]] for future testing
+4. Evaluate fasttext-pure-rs (Option B) first — claims Facebook .ftz 
+   compatibility, pure-Rust, one cargo add + diagnostic probe = 30 second test
+5. If Option B fails: accept whichlang's 16 languages as production surface
+
+### Egress impact of defaulting to whichlang
+Default code path has ZERO network egress for classification.
+Only Whisper still does a one-time model download.
+Offline invariant gets stronger, not weaker.
+
+### Files to update in Sprint 2
+- apps/verify-cli/src/main.rs:30 — flip default
+- crates/verify-classifier/src/classifier.rs — mark fasttext experimental
+- CLAUDE.md — document the limitation
+- crates/verify-classifier/examples/lid_label_probe.rs — commit as example
