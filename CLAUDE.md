@@ -183,10 +183,60 @@ opt-in API.
   `TRANSLATION_STUB` sentinel from `verify-translate` in
   Sprint 1 — replaced by real NLLB in Sprint 2.
 
-## What is deferred to Sprint 2+
+## Sprint 2 decisions (shipped 2026-04-25)
 
-- NLLB-200 translation integration (replaces `TRANSLATION_STUB`).
-- Tesseract OCR.
-- Video pipeline (ffmpeg audio extract → STT → NLLB).
-- `verify-plugin-sdk` wired to the real Strata plugin API.
-- Integration tests against real audio / image fixtures.
+- **Whisper STT — `candle-whisper` (pure Rust, Metal).** The
+  candle build probe completed in ~44 s on macOS ARM64 with the
+  `metal` feature; no cmake / FFI. We fetch safetensors weights
+  from `openai/whisper-{tiny,base,large-v3}` via `hf-hub`, bundle
+  the 80-bin and 128-bin mel filter banks under
+  `crates/verify-stt/assets/`, and run a greedy decoder with
+  timestamp tokens to produce per-segment `[start_ms, end_ms,
+  text]` tuples. The Sprint 1 GGML URL constants were retired —
+  candle reads safetensors only.
+- **NLLB-200 translation — Python + transformers subprocess.**
+  candle does not ship NLLB's MBart-style architecture, so per
+  the decision rule we ship Option B: a bundled
+  `crates/verify-translate/src/script.py` driven by `python3 -c`
+  per call. HF cache is forced under
+  `~/.cache/verify/models/nllb/` via `VERIFY_HF_CACHE`. The model
+  is `facebook/nllb-200-distilled-600M`. ctranslate2 (Option C)
+  is a drop-in performance upgrade — same script shape.
+- **Machine-translation advisory is load-bearing.** Every
+  `TranslationResult` carries `is_machine_translation = true` and
+  a non-empty `advisory_notice`. The CLI prints the notice on
+  every translate run; there is no suppression flag. The
+  `verify_translate::tests::machine_translation_advisory_always_present`
+  test pins this invariant in the build.
+- **Tesseract OCR — subprocess (no `tesseract` installed at build
+  time).** Same pattern as `ffmpeg` for audio: spawn the
+  `tesseract` CLI with `<input> stdout -l <lang>`. The `tesseract`
+  / `leptess` Rust crates require `libtesseract`+`libleptonica`
+  system libs; subprocessing keeps VERIFY's pure-Rust build
+  story intact and avoids C/C++ FFI inside the binary.
+- **Pipeline orchestration lives in the CLI.** `verify-core`
+  exposes the data shapes (`PipelineInput`, `PipelineResult`,
+  `TimedSegment`) but does not depend on the engines —
+  introducing such a dep would cycle (each engine already
+  depends on `verify-core` for `VerifyError`). The CLI wires
+  classifier + STT + OCR + translation directly. A future
+  `verify-pipeline` crate can house this glue if a second
+  embedder (e.g. the real Strata plugin) needs it.
+- **`verify-plugin-sdk` adapter shape only.** Upstream
+  `strata-plugin-sdk` is not yet vendored into this workspace,
+  so we ship the `ArtifactRecord` + `Confidence` + plugin
+  metadata shapes plus the `artifact_from_translation` converter.
+  The `StrataPlugin` trait `impl` is a thin shim landed when the
+  SDK appears.
+
+## What remains for Sprint 3+
+
+- Video pipeline (ffmpeg audio extract → existing STT → NLLB).
+- Real Strata plugin trait `impl` (requires upstream SDK in workspace).
+- Integration tests against real audio / image fixtures
+  (currently `#[ignore]`-gated on `VERIFY_RUN_INTEGRATION_TESTS=1`).
+- Whisper temperature-fallback decoding + full timestamp rules
+  (Sprint 2 ships greedy + suppress_tokens; matches behaviour
+  for the dominant case but can diverge on highly noisy audio).
+- ctranslate2 backend swap for NLLB (Option C, 3–5× faster than
+  raw transformers on CPU).

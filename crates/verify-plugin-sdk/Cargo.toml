@@ -4,9 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Strata plugin adapter — lets VERIFY load inside Strata (stub in Sprint 1)."
+description = "Strata plugin adapter — exposes VERIFY translations as Strata-shaped artifacts."
 
 [dependencies]
 verify-core = { path = "../verify-core" }
+verify-translate = { path = "../verify-translate" }
 log = { workspace = true }
 thiserror = { workspace = true }

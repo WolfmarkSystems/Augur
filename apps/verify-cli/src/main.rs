@@ -13,6 +13,8 @@ use verify_core::VerifyError;
 use verify_stt::{
     ModelManager as WhisperModelManager, SttEngine, SttResult, WhisperPreset,
 };
+use verify_ocr::{iso_to_tesseract, OcrEngine};
+use verify_translate::{TranslationEngine, MACHINE_TRANSLATION_NOTICE};
 
 /// Exact `--version` / `-V` output. Kept as a `const` so it's
 /// greppable and so it doesn't drift from the `Cargo.toml`
@@ -92,13 +94,30 @@ enum Command {
         preset: CliPreset,
     },
 
-    /// Full pipeline: classify → transcribe → translate.
-    /// Sprint 1 stubs out STT and translation; Sprint 2 wires real
-    /// inference.
+    /// Full pipeline: classify → transcribe (if audio) → translate.
+    /// Sprint 2 wires real Whisper STT and NLLB-200 translation;
+    /// every translation output carries a mandatory machine-
+    /// translation advisory notice.
     Translate {
-        /// Path to the audio file.
-        #[arg(long)]
-        input: PathBuf,
+        /// Path to an audio file. Mutually exclusive with --text /
+        /// --image.
+        #[arg(long, conflicts_with_all = ["text", "image"])]
+        input: Option<PathBuf>,
+
+        /// Inline text input (skip STT/OCR entirely).
+        #[arg(long, conflicts_with_all = ["input", "image"])]
+        text: Option<String>,
+
+        /// Path to an image file (PNG/JPG/TIFF/...). Routes through
+        /// Tesseract OCR before classification + translation.
+        #[arg(long, conflicts_with_all = ["input", "text"])]
+        image: Option<PathBuf>,
+
+        /// OCR language hint (ISO 639-1). Defaults to English; for
+        /// non-Latin scripts pass `--ocr-lang ar` etc. so Tesseract
+        /// loads the right tessdata file.
+        #[arg(long, default_value = "en")]
+        ocr_lang: String,
 
         /// Target language — ISO 639-1 code.
         #[arg(long, default_value = "en")]
@@ -169,9 +188,20 @@ fn run(command: Command, backend: ClassifierBackend) -> Result<(), VerifyError> 
         Command::Transcribe { input, preset } => cmd_transcribe(&input, preset.into()),
         Command::Translate {
             input,
+            text,
+            image,
+            ocr_lang,
             target,
             preset,
-        } => cmd_translate(&input, &target, preset.into(), backend),
+        } => cmd_translate(
+            input.as_deref(),
+            text.as_deref(),
+            image.as_deref(),
+            &ocr_lang,
+            &target,
+            preset.into(),
+            backend,
+        ),
     }
 }
 
@@ -198,54 +228,149 @@ fn cmd_classify(
 // ── transcribe ───────────────────────────────────────────────────
 
 fn cmd_transcribe(input: &std::path::Path, preset: WhisperPreset) -> Result<(), VerifyError> {
-    let (transcript_line, detected_lang, confidence) = run_stt(input, preset);
+    let result = try_run_stt(input, preset)?;
     println_verify(format!(
         "Language detected: {} (confidence: {:.2})",
-        detected_lang, confidence
+        result.detected_language, result.confidence
     ));
-    println_verify(format!("Transcript: {transcript_line}"));
+    println_verify("Transcript:");
+    for seg in &result.segments {
+        let start = format_ms(seg.start_ms);
+        let end = format_ms(seg.end_ms);
+        println_verify(format!("  [{start} - {end}] {}", seg.text));
+    }
+    println_verify(format!(
+        "Complete. {} segment(s).",
+        result.segments.len()
+    ));
     Ok(())
+}
+
+fn format_ms(ms: u64) -> String {
+    let total_s = ms / 1000;
+    let m = total_s / 60;
+    let s = total_s % 60;
+    format!("{m}:{s:02}")
 }
 
 // ── translate ────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_translate(
-    input: &std::path::Path,
+    input: Option<&std::path::Path>,
+    text: Option<&str>,
+    image: Option<&std::path::Path>,
+    ocr_lang: &str,
     target: &str,
     preset: WhisperPreset,
     backend: ClassifierBackend,
 ) -> Result<(), VerifyError> {
-    // Step 1 — STT (Sprint 1: stub). Surface whatever the STT
-    // layer gave us so the output format mirrors the final
-    // Sprint 2 shape.
-    let (transcript_line, detected_lang, stt_confidence) = run_stt(input, preset);
+    // Resolve source text from one of three input modes. The
+    // pipelines diverge here:
+    //   audio → preprocess → STT → classifier → NLLB
+    //   image → OCR        → classifier → NLLB
+    //   text  → classifier → NLLB
+    let (source_text, source_lang, source_confidence, segments) =
+        match (input, text, image) {
+            (Some(path), None, None) => {
+                let stt = try_run_stt(path, preset)?;
+                (
+                    stt.transcript.clone(),
+                    stt.detected_language.clone(),
+                    stt.confidence,
+                    Some(stt.segments),
+                )
+            }
+            (None, Some(t), None) => {
+                let classifier = build_classifier(backend)?;
+                let cr = classifier.classify(t, target)?;
+                (t.to_string(), cr.language.clone(), cr.confidence, None)
+            }
+            (None, None, Some(img)) => {
+                let tess_lang = iso_to_tesseract(ocr_lang)?;
+                let engine = OcrEngine::new(tess_lang)?;
+                println_verify(format!("Running OCR ({tess_lang}) on {img:?}..."));
+                let ocr = engine.extract_text(img)?;
+                println_verify(format!("Extracted text: {}", ocr.text));
+                (ocr.text, ocr_lang.to_string(), ocr.confidence, None)
+            }
+            (None, None, None) => {
+                return Err(VerifyError::InvalidInput(
+                    "verify translate requires --input <audio> | --text <string> | --image <path>"
+                        .to_string(),
+                ));
+            }
+            _ => {
+                return Err(VerifyError::InvalidInput(
+                    "verify translate accepts only one of --input / --text / --image".to_string(),
+                ));
+            }
+        };
 
-    // Step 2 — classify the transcript. Sprint 1: the stub STT
-    // surfaces a sentinel string, so classify runs against that
-    // marker. In Sprint 2 this receives the real transcript and
-    // produces the canonical language answer.
-    let classifier = build_classifier(backend)?;
-    let cr = classifier.classify(&transcript_line, target)?;
-    let lang = if cr.language.is_empty() {
-        detected_lang.clone()
+    // For audio + image inputs, also re-classify the extracted
+    // text — STT and OCR language hints can be coarse; the text
+    // classifier (fastText / whichlang) gives the canonical answer.
+    let lang = if (input.is_some() || image.is_some()) && !source_text.trim().is_empty() {
+        let classifier = build_classifier(backend)?;
+        let cr = classifier.classify(&source_text, target)?;
+        if cr.language.is_empty() {
+            source_lang
+        } else {
+            cr.language
+        }
     } else {
-        cr.language.clone()
+        source_lang
     };
-    let confidence = if cr.confidence > 0.0 {
-        cr.confidence
-    } else {
-        stt_confidence
-    };
-
-    // Step 3 — translate. Sprint 1: always the sentinel.
-    let translation = verify_translate::translate_stub(&transcript_line, &lang, target)?;
 
     println_verify(format!(
-        "Language detected: {} (confidence: {:.2})",
-        lang, confidence
+        "Language detected: {lang} (confidence: {:.2})",
+        source_confidence
     ));
-    println_verify(format!("Transcript: {transcript_line}"));
-    println_verify(format!("Translation: [{translation}]"));
+
+    if let Some(segs) = &segments {
+        println_verify("Transcript:");
+        for seg in segs {
+            let start = format_ms(seg.start_ms);
+            let end = format_ms(seg.end_ms);
+            println_verify(format!("  [{start} - {end}] {}", seg.text));
+        }
+    } else {
+        println_verify(format!("Source text: {source_text}"));
+    }
+
+    if lang == target {
+        println_verify(format!(
+            "Source already in target language ({target}); no translation needed."
+        ));
+        return Ok(());
+    }
+
+    let engine = TranslationEngine::with_xdg_cache()?;
+    let translation = engine.translate(&source_text, &lang, target)?;
+
+    println_verify(format!(
+        "Translating {} → {} via {}...",
+        lang, target, translation.model
+    ));
+    println_verify(format!("Translation: {}", translation.translated_text));
+
+    // Mandatory advisory — every translation output is labeled.
+    println_verify("");
+    println_verify("⚠  MACHINE TRANSLATION NOTICE");
+    println_verify(format!("   {MACHINE_TRANSLATION_NOTICE}"));
+    println_verify(format!("   Model: {}", translation.model));
+    println_verify(format!(
+        "   Source language: {} ({})",
+        translation.source_language,
+        verify_translate::iso_to_nllb(&translation.source_language)
+            .unwrap_or("?")
+    ));
+    println_verify(format!(
+        "   Target language: {} ({})",
+        translation.target_language,
+        verify_translate::iso_to_nllb(&translation.target_language)
+            .unwrap_or("?")
+    ));
     Ok(())
 }
 
@@ -284,26 +409,10 @@ fn build_fasttext() -> Result<LanguageClassifier, VerifyError> {
     LanguageClassifier::load_fasttext(&path)
 }
 
-/// Sprint 1: runs STT (stub) and surfaces the structured error
-/// message inline rather than aborting the whole command. Return
-/// tuple is (transcript-or-stub-marker, detected-lang, confidence).
-fn run_stt(input: &std::path::Path, preset: WhisperPreset) -> (String, String, f32) {
-    match try_run_stt(input, preset) {
-        Ok(r) => (r.transcript, r.detected_language, r.confidence),
-        Err(e) => {
-            // Stub is expected in Sprint 1; log::debug so an
-            // examiner running `RUST_LOG=debug` sees context
-            // without flooding the default-level output.
-            log::debug!("STT stub returned: {e}");
-            ("[STT stub — Sprint 2]".to_string(), String::new(), 0.0)
-        }
-    }
-}
-
 fn try_run_stt(input: &std::path::Path, preset: WhisperPreset) -> Result<SttResult, VerifyError> {
     // Validate the audio file BEFORE touching the network. An
     // examiner who types a wrong path should not accidentally
-    // trigger a 75 MB / 142 MB / 2.9 GB Whisper download. This
+    // trigger a 150 MB / 290 MB / 3 GB Whisper download. This
     // keeps the egress truly "only when needed."
     if !input.exists() {
         return Err(VerifyError::InvalidInput(format!(
@@ -311,8 +420,8 @@ fn try_run_stt(input: &std::path::Path, preset: WhisperPreset) -> Result<SttResu
         )));
     }
     let mgr = WhisperModelManager::with_xdg_cache()?;
-    let model_path = mgr.ensure_whisper_model(preset)?;
-    let engine = SttEngine::load(&model_path, preset)?;
+    let paths = mgr.ensure_whisper_model(preset)?;
+    let mut engine = SttEngine::load(&paths, preset)?;
     engine.transcribe(input)
 }
 
