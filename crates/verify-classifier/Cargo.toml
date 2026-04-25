@@ -10,3 +10,7 @@ description = "Language identification router (fastText LID / whichlang). Sprint
 verify-core = { path = "../verify-core" }
 log = { workspace = true }
 thiserror = { workspace = true }
+# P2 decision rule: try `fasttext` first; fall back to `whichlang` on
+# FFI / system-lib problems. See CLAUDE.md "Library choice" note.
+fasttext = "0.8"
+whichlang = "0.1.1"
