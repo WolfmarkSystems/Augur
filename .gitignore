@@ -6,6 +6,8 @@ Cargo.lock
 *.bin
 *.gguf
 *.ggml
+*.ftz
+*.fasttext
 models/
 weights/
 .cache/
