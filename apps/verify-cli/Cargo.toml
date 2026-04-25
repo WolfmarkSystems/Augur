@@ -1,0 +1,15 @@
+[package]
+name = "verify-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "`verify` CLI — standalone binary."
+
+[[bin]]
+name = "verify"
+path = "src/main.rs"
+
+[dependencies]
+verify-core = { path = "../../crates/verify-core" }
+log = { workspace = true }

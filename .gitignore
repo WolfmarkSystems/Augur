@@ -1,0 +1,18 @@
+/target/
+Cargo.lock
+
+# Model weights — NEVER commit (see VERIFY offline invariant).
+*.weights
+*.bin
+*.gguf
+*.ggml
+models/
+weights/
+.cache/
+
+# Editor / OS noise
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/

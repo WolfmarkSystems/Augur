@@ -1,0 +1,12 @@
+[package]
+name = "verify-translate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "NLLB-200 translation (stub in Sprint 1)."
+
+[dependencies]
+verify-core = { path = "../verify-core" }
+log = { workspace = true }
+thiserror = { workspace = true }

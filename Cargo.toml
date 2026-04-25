@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/verify-core",
+    "crates/verify-classifier",
+    "crates/verify-stt",
+    "crates/verify-translate",
+    "crates/verify-ocr",
+    "crates/verify-plugin-sdk",
+    "apps/verify-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Proprietary"
+authors = ["Wolfmark Systems"]
+
+[workspace.dependencies]
+log = "0.4"
+thiserror = "1"

@@ -1,0 +1,11 @@
+[package]
+name = "verify-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "VERIFY pipeline orchestrator and unified error type."
+
+[dependencies]
+log = { workspace = true }
+thiserror = { workspace = true }
