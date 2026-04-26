@@ -235,6 +235,23 @@ pub fn run_airgap_check() -> SelfTestCheck {
     }
 }
 
+/// Sprint 7 P1 — GeoIP database availability. Pure check — never
+/// loads the database, just resolves whether one is configured.
+pub fn run_geoip_check() -> SelfTestCheck {
+    match verify_core::geoip::check_status() {
+        Ok(path) => SelfTestCheck {
+            name: "GeoIP: GeoLite2 database configured".into(),
+            status: CheckStatus::Pass,
+            message: format!("found at {path:?}"),
+        },
+        Err(blurb) => SelfTestCheck {
+            name: "GeoIP: GeoLite2 database configured".into(),
+            status: CheckStatus::Skip,
+            message: blurb,
+        },
+    }
+}
+
 pub fn run_hf_token_check() -> SelfTestCheck {
     let path = home_relative(".cache/verify/hf_token");
     if path.as_ref().map(|p| p.exists()).unwrap_or(false) {
@@ -364,6 +381,7 @@ pub fn run_self_test(full: bool) -> Result<SelfTestResult, VerifyError> {
     ));
     checks.push(run_airgap_check());
     checks.push(run_hf_token_check());
+    checks.push(run_geoip_check());
     if full {
         checks.push(run_full_translation_check());
     }

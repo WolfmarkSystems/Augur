@@ -10,6 +10,9 @@
 //! Real orchestration logic lands in Sprint 2+.
 
 pub mod error;
+pub mod geoip;
 pub mod pipeline;
+pub mod report;
+pub mod timestamps;
 
 pub use error::VerifyError;

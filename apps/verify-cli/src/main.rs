@@ -11,6 +11,12 @@ use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use verify_classifier::{LanguageClassifier, ModelManager as ClassifierModelManager};
+use verify_core::geoip::{GeoIpEngine, GeoIpResult, GEOIP_DB_INSTRUCTIONS};
+use verify_core::report::{render_batch_html, ReportConfig};
+use verify_core::timestamps::{
+    convert as ts_convert, detect_and_convert as ts_detect, parse_input_file as ts_parse,
+    TimestampFormat, TimestampResult,
+};
 use verify_core::pipeline::{
     detect_input_kind, render_batch_csv, BatchFileResult, BatchResult, BatchSegment,
     PipelineInput,
@@ -192,6 +198,46 @@ enum Command {
         diarize: bool,
     },
 
+    /// Convert a forensic timestamp (Unix / Apple / Windows /
+    /// WebKit / HFS+) into a human-readable UTC time. With no
+    /// `--format`, all plausible interpretations are listed.
+    Timestamp {
+        /// The integer timestamp value. Accepts negative values.
+        /// Mutually exclusive with `--input`.
+        #[arg(conflicts_with = "input")]
+        value: Option<i64>,
+
+        /// File of "<value> [label]" lines (one per line). `#`
+        /// prefix or blank line = ignored.
+        #[arg(long, conflicts_with = "value")]
+        input: Option<PathBuf>,
+
+        /// Force a specific format. Default behaviour is to list
+        /// every plausible interpretation.
+        #[arg(long)]
+        format: Option<String>,
+    },
+
+    /// Geolocate one or more IP addresses against a MaxMind
+    /// GeoLite2-City database. The database is NOT auto-
+    /// downloaded (MaxMind license); pass `--setup` for the
+    /// download instructions or set `VERIFY_GEOIP_PATH`.
+    Geoip {
+        /// IP address to look up. Mutually exclusive with
+        /// `--input` and `--setup`.
+        #[arg(conflicts_with_all = ["input", "setup"])]
+        ip: Option<String>,
+
+        /// File with one IP address per line (blank lines and
+        /// `#`-prefixed comments ignored).
+        #[arg(long, conflicts_with_all = ["ip", "setup"])]
+        input: Option<PathBuf>,
+
+        /// Print MaxMind GeoLite2 setup instructions and exit.
+        #[arg(long, conflicts_with_all = ["ip", "input"])]
+        setup: bool,
+    },
+
     /// Pre-deployment readiness check — runs a battery of
     /// classification, model-cache, and tooling checks and reports
     /// whether the installation is ready for casework. Default
@@ -223,6 +269,14 @@ enum Command {
     /// Process an entire directory of evidence files. Walks the
     /// folder, classifies each file, and translates the foreign-
     /// language ones. Optionally writes a consolidated JSON report.
+    /// View / write the report config used by `verify batch`.
+    /// The config carries agency name, case number, examiner
+    /// signature, and classification marking.
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
+
     Batch {
         /// Path to the evidence directory.
         #[arg(long)]
@@ -251,7 +305,54 @@ enum Command {
         /// Whisper model preset for audio/video files.
         #[arg(long, value_enum, default_value_t = CliPreset::Balanced)]
         preset: CliPreset,
+
+        /// Optional `verify config` TOML — supplies agency
+        /// name / case number / examiner signature / classification
+        /// marking for the rendered report. Default location:
+        /// `~/.verify_report.toml`.
+        #[arg(long)]
+        config: Option<PathBuf>,
+
+        /// Output format. `auto` infers from `--output` extension
+        /// (`.csv` → CSV, `.html`/`.htm` → HTML, else JSON).
+        #[arg(long, value_enum, default_value_t = CliReportFormat::Auto)]
+        format: CliReportFormat,
     },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum ConfigAction {
+    /// Write a default TOML config to `--output` (or
+    /// `~/.verify_report.toml` if not specified). Refuses to
+    /// overwrite an existing file unless `--force` is set.
+    Init {
+        #[arg(long)]
+        output: Option<PathBuf>,
+        #[arg(long, default_value_t = false)]
+        force: bool,
+    },
+    /// Print the current config to stdout (TOML form).
+    Show {
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
+    /// Set a single config field. Recognized keys:
+    /// `agency_name` / `case_number` / `examiner_name` /
+    /// `examiner_badge` / `classification` / `report_title`.
+    Set {
+        key: String,
+        value: String,
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliReportFormat {
+    Auto,
+    Json,
+    Csv,
+    Html,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -341,6 +442,12 @@ fn run(
         ),
         Command::Setup { hf_token } => cmd_setup(&hf_token),
         Command::SelfTest { full } => cmd_self_test(full),
+        Command::Geoip { ip, input, setup } => cmd_geoip(ip.as_deref(), input.as_deref(), setup),
+        Command::Timestamp {
+            value,
+            input,
+            format,
+        } => cmd_timestamp(value, input.as_deref(), format.as_deref()),
         Command::Batch {
             input,
             target,
@@ -348,6 +455,8 @@ fn run(
             output,
             ocr_lang,
             preset,
+            config,
+            format,
         } => cmd_batch(
             &input,
             &target,
@@ -357,7 +466,10 @@ fn run(
             preset.into(),
             backend,
             translation_backend,
+            config.as_deref(),
+            format,
         ),
+        Command::Config { action } => cmd_config(action),
     }
 }
 
@@ -726,6 +838,140 @@ fn cmd_self_test(full: bool) -> Result<(), VerifyError> {
     }
 }
 
+fn cmd_timestamp(
+    value: Option<i64>,
+    input: Option<&std::path::Path>,
+    format: Option<&str>,
+) -> Result<(), VerifyError> {
+    let chosen = match format {
+        Some(f) => Some(TimestampFormat::from_str(f).ok_or_else(|| {
+            VerifyError::InvalidInput(format!(
+                "unknown timestamp format {f:?}; valid: unix-seconds, \
+                 unix-ms, unix-us, unix-ns, apple-coredata, apple-ns, \
+                 windows-filetime, webkit, hfs-plus, cocoa-date"
+            ))
+        })?),
+        None => None,
+    };
+    if let Some(v) = value {
+        run_timestamp(v, None, chosen);
+    } else if let Some(path) = input {
+        let body = std::fs::read_to_string(path)?;
+        let entries = ts_parse(&body)?;
+        for (idx, (val, label)) in entries.iter().enumerate() {
+            if idx > 0 {
+                println_verify("");
+            }
+            run_timestamp(*val, label.as_deref(), chosen);
+        }
+    } else {
+        return Err(VerifyError::InvalidInput(
+            "verify timestamp requires <value> or --input <file>".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn run_timestamp(value: i64, label: Option<&str>, format: Option<TimestampFormat>) {
+    let header = match label {
+        Some(l) => format!("Timestamp: {value} ({l})"),
+        None => format!("Timestamp: {value}"),
+    };
+    println_verify(header);
+    let results: Vec<TimestampResult> = match format {
+        Some(fmt) => vec![ts_convert(value, fmt)],
+        None => ts_detect(value),
+    };
+    if results.is_empty() {
+        println_verify("  (no plausible interpretation in supported range)");
+        return;
+    }
+    println_verify(format!(
+        "  {:<22} {:<10} {}",
+        "Format", "Confidence", "UTC"
+    ));
+    println_verify(format!(
+        "  {:<22} {:<10} {}",
+        "----------------------", "----------", "------------------------"
+    ));
+    for r in &results {
+        let utc = if r.utc.is_empty() {
+            "(out of range)".to_string()
+        } else {
+            r.utc.clone()
+        };
+        println_verify(format!(
+            "  {:<22} {:<10} {utc}",
+            r.format.as_str(),
+            r.confidence,
+        ));
+    }
+}
+
+fn cmd_geoip(
+    ip: Option<&str>,
+    input: Option<&std::path::Path>,
+    setup: bool,
+) -> Result<(), VerifyError> {
+    if setup {
+        println_verify("MaxMind GeoLite2 setup");
+        for line in GEOIP_DB_INSTRUCTIONS.split('\n') {
+            println_verify(format!("  {line}"));
+        }
+        if let Some(p) = verify_core::geoip::configured_db_path() {
+            println_verify(format!("Currently configured: {p:?}"));
+        } else {
+            println_verify("Currently configured: (none — install per the above)");
+        }
+        return Ok(());
+    }
+    let engine = GeoIpEngine::with_xdg_cache()?;
+    if let Some(addr) = ip {
+        let r = engine.lookup(addr)?;
+        print_geoip(&r);
+    } else if let Some(path) = input {
+        let body = std::fs::read_to_string(path)?;
+        for line in body.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            match engine.lookup(trimmed) {
+                Ok(r) => print_geoip(&r),
+                Err(e) => println_verify(format!("{trimmed}: {e}")),
+            }
+            println_verify("");
+        }
+    } else {
+        return Err(VerifyError::InvalidInput(
+            "verify geoip requires <IP> or --input <file> or --setup".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn print_geoip(r: &GeoIpResult) {
+    println_verify(format!("GeoIP: {}", r.ip));
+    if r.is_private {
+        println_verify("  Private: Yes (RFC 1918 / loopback / link-local — no public geolocation)");
+        return;
+    }
+    let country = match (&r.country_code, &r.country_name) {
+        (Some(code), Some(name)) => format!("{name} ({code})"),
+        (Some(code), None) => code.clone(),
+        (None, Some(name)) => name.clone(),
+        (None, None) => "(unknown)".into(),
+    };
+    println_verify(format!("  Country: {country}"));
+    if let Some(c) = &r.city {
+        println_verify(format!("  City: {c}"));
+    }
+    if let (Some(lat), Some(lon)) = (r.latitude, r.longitude) {
+        println_verify(format!("  Coords: {lat:.4}, {lon:.4}"));
+    }
+    println_verify("  Private: No");
+}
+
 fn cmd_setup(token: &str) -> Result<(), VerifyError> {
     let mgr = HfTokenManager::with_xdg_cache()?;
     mgr.save(token)?;
@@ -873,7 +1119,10 @@ fn cmd_batch(
     preset: WhisperPreset,
     backend: ClassifierBackend,
     translation_backend: TranslationBackend,
+    config_path: Option<&std::path::Path>,
+    format: CliReportFormat,
 ) -> Result<(), VerifyError> {
+    let config = load_report_config(config_path)?;
     if !input.exists() || !input.is_dir() {
         return Err(VerifyError::InvalidInput(format!(
             "batch --input must be a directory, got {input:?}"
@@ -1035,7 +1284,7 @@ fn cmd_batch(
     ));
 
     if let Some(out_path) = output {
-        write_batch_report(out_path, &report)?;
+        write_batch_report(out_path, &report, &config, format)?;
         println_verify(format!("Report written to {out_path:?}"));
         // The progress file is intentionally NOT removed — examiners
         // may want it as evidence of a long-run audit trail. Note its
@@ -1093,23 +1342,53 @@ fn write_progress(
     Ok(())
 }
 
-/// Render and write a [`BatchResult`] to `out_path`. Format chosen
-/// by the path's extension: `.csv` → RFC-4180 CSV, anything else
-/// → pretty-printed JSON.
+/// Render and write a [`BatchResult`] to `out_path`. Format
+/// honours the explicit `--format` flag; `Auto` picks by
+/// extension (`.csv` → CSV, `.html`/`.htm` → HTML, else JSON).
+/// JSON output gets the optional `report_metadata` block from
+/// the loaded report config.
 fn write_batch_report(
     out_path: &std::path::Path,
     report: &BatchResult,
+    config: &ReportConfig,
+    format: CliReportFormat,
 ) -> Result<(), VerifyError> {
-    let is_csv = out_path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|s| s.eq_ignore_ascii_case("csv"))
-        .unwrap_or(false);
-    let body = if is_csv {
-        render_batch_csv(report)
-    } else {
-        serde_json::to_string_pretty(report)
-            .map_err(|e| VerifyError::Translate(format!("batch JSON serialise: {e}")))?
+    let resolved = match format {
+        CliReportFormat::Auto => match out_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("csv") => CliReportFormat::Csv,
+            Some("html") | Some("htm") => CliReportFormat::Html,
+            _ => CliReportFormat::Json,
+        },
+        explicit => explicit,
+    };
+    let body = match resolved {
+        CliReportFormat::Csv => render_batch_csv(report),
+        CliReportFormat::Html => render_batch_html(report, config),
+        CliReportFormat::Json | CliReportFormat::Auto => {
+            // Auto can't reach here — the match above resolves it.
+            // We still serialise JSON; metadata block is woven in
+            // at the top when `config` carries any agency fields.
+            let mut value = serde_json::to_value(report).map_err(|e| {
+                VerifyError::Translate(format!("batch JSON serialise: {e}"))
+            })?;
+            if let Some(meta) = config.metadata_json(&report.generated_at) {
+                if let serde_json::Value::Object(map) = &mut value {
+                    let mut prefixed = serde_json::Map::new();
+                    prefixed.insert("report_metadata".into(), meta);
+                    for (k, v) in map.iter() {
+                        prefixed.insert(k.clone(), v.clone());
+                    }
+                    value = serde_json::Value::Object(prefixed);
+                }
+            }
+            serde_json::to_string_pretty(&value)
+                .map_err(|e| VerifyError::Translate(format!("batch JSON serialise: {e}")))?
+        }
     };
     if let Some(parent) = out_path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -1117,6 +1396,87 @@ fn write_batch_report(
         }
     }
     std::fs::write(out_path, body)?;
+    Ok(())
+}
+
+fn load_report_config(path: Option<&std::path::Path>) -> Result<ReportConfig, VerifyError> {
+    let path = match path {
+        Some(p) => p.to_path_buf(),
+        None => default_config_path()?,
+    };
+    if !path.exists() {
+        return Ok(ReportConfig::blank());
+    }
+    ReportConfig::load(&path)
+}
+
+fn default_config_path() -> Result<PathBuf, VerifyError> {
+    let home = std::env::var("HOME").map_err(|_| {
+        VerifyError::InvalidInput("HOME not set; pass --config explicitly".to_string())
+    })?;
+    Ok(PathBuf::from(home).join(".verify_report.toml"))
+}
+
+fn cmd_config(action: ConfigAction) -> Result<(), VerifyError> {
+    match action {
+        ConfigAction::Init { output, force } => {
+            let path = match output {
+                Some(p) => p,
+                None => default_config_path()?,
+            };
+            if path.exists() && !force {
+                return Err(VerifyError::InvalidInput(format!(
+                    "{path:?} already exists; pass --force to overwrite"
+                )));
+            }
+            let cfg = ReportConfig::blank();
+            let body = cfg.to_toml_string()?;
+            if let Some(parent) = path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    std::fs::create_dir_all(parent)?;
+                }
+            }
+            std::fs::write(&path, body)?;
+            println_verify(format!("Wrote default config to {path:?}"));
+        }
+        ConfigAction::Show { path } => {
+            let cfg = load_report_config(path.as_deref())?;
+            let body = cfg.to_toml_string()?;
+            // Show via the CLI helper so output stays prefixed.
+            for line in body.lines() {
+                println_verify(line);
+            }
+        }
+        ConfigAction::Set { key, value, path } => {
+            let target = match path {
+                Some(p) => p,
+                None => default_config_path()?,
+            };
+            let mut cfg = if target.exists() {
+                ReportConfig::load(&target)?
+            } else {
+                ReportConfig::blank()
+            };
+            match key.as_str() {
+                "agency_name" => cfg.agency_name = Some(value),
+                "case_number" => cfg.case_number = Some(value),
+                "examiner_name" => cfg.examiner_name = Some(value),
+                "examiner_badge" => cfg.examiner_badge = Some(value),
+                "classification" => cfg.classification = Some(value),
+                "report_title" => cfg.report_title = Some(value),
+                other => {
+                    return Err(VerifyError::InvalidInput(format!(
+                        "unknown config key {other:?}; valid: agency_name, \
+                         case_number, examiner_name, examiner_badge, \
+                         classification, report_title"
+                    )));
+                }
+            }
+            let body = cfg.to_toml_string()?;
+            std::fs::write(&target, body)?;
+            println_verify(format!("Updated {key} in {target:?}"));
+        }
+    }
     Ok(())
 }
 

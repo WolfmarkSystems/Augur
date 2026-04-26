@@ -437,7 +437,51 @@ opt-in API.
   confused language pairs documented in
   `docs/LANGUAGE_LIMITATIONS.md`.
 
-## What remains for Sprint 7+
+## Sprint 7 decisions (shipped 2026-04-26)
+
+- **IP geolocation via MaxMind GeoLite2.** New
+  `verify_core::geoip` module — `GeoIpEngine`, `GeoIpResult`,
+  `is_private` (RFC 1918 + loopback + link-local + IPv4 CGN +
+  IPv6 ULA + multicast), `configured_db_path`, `check_status`.
+  Uses the pure-Rust `maxminddb = "0.28"` crate; the 0.28 API
+  shape (`Reader::lookup → LookupResult.decode::<geoip2::City>`)
+  is wrapped at our layer. **MaxMind license bars auto-
+  download**, so VERIFY does NOT fetch the database itself —
+  examiners place the file at `$VERIFY_GEOIP_PATH` or
+  `~/.cache/verify/GeoLite2-City.mmdb`. Missing-DB returns the
+  new `VerifyError::GeoIpNotConfigured(...)` variant carrying
+  the install instructions; never panics, never silently falls
+  back. CLI: `verify geoip <ip>` / `--input ips.txt` /
+  `--setup`. `verify self-test` reports the DB status as a new
+  Pass/Skip check.
+- **Batch report customization.** New `verify_core::report`
+  module — `ReportConfig` (agency / case / examiner / badge /
+  classification / report title / logo / boolean toggles),
+  TOML serializer/deserializer, `metadata_json` block,
+  `render_batch_html` self-contained HTML renderer. CLI: `verify
+  config init|show|set` writes / reads `~/.verify_report.toml`;
+  `verify batch --config <path> --format html|json|csv|auto`
+  threads it into the batch report. The forensic invariant is
+  pinned at the schema level: `include_mt_advisory` is forced
+  to `true` on load even if the on-disk TOML attempts `false`,
+  and the HTML renderer emits the MT notice both at the top
+  and bottom of the document. User-supplied strings are
+  HTML-escaped against XSS in the rendered HTML.
+- **Forensic timestamp converter.** New `verify_core::timestamps`
+  module — `TimestampFormat::{UnixSeconds | UnixMs | UnixUs |
+  UnixNs | AppleCoreData | AppleNs | WindowsFiletime | WebKit |
+  HfsPlus | CocoaDate}`, `convert(value, format)` and
+  `detect_and_convert(value)` that returns plausible
+  interpretations ranked by confidence. ISO-8601 UTC formatting
+  is hand-rolled via Howard Hinnant's civil-date algorithm so
+  we don't pull in `chrono` for one date helper. CLI:
+  `verify timestamp <value>` (auto-list) /
+  `verify timestamp <value> --format windows-filetime` (single)
+  / `verify timestamp --input file.txt` (batch). 9 unit tests
+  pin every reference conversion (Unix epoch ↔ Windows FILETIME
+  ↔ WebKit ↔ Apple ↔ HFS+).
+
+## What remains for Sprint 8+
 
 - Examiner-assigned speaker labels (overwrite `SPEAKER_00` →
   `Suspect A` and persist across runs).
@@ -445,8 +489,9 @@ opt-in API.
 - Optional auto-conversion to ct2 on first install — pay the
   one-time cost up front for the 2.85× steady-state speedup.
 - Script-aware Pashto/Persian tiebreaker (orthographic features
-  rather than statistical n-grams) — the Sprint 6 advisory is
-  the right examiner-facing answer; a script-level disambiguator
-  would be a quality improvement on top.
+  rather than statistical n-grams).
 - Sr/Hr/Bs, Ms/Id, Hi/Ur language-pair advisories along the
   same shape as Sprint 6's fa/ps disambiguation.
+- Optional second MaxMind reader for the GeoLite2-ASN database
+  (so `GeoIpResult.asn` / `org` populate when the user has
+  both `City` and `ASN` files).

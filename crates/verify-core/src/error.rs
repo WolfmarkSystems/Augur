@@ -29,4 +29,15 @@ pub enum VerifyError {
 
     #[error("invalid input: {0}")]
     InvalidInput(String),
+
+    #[error("geoip error: {0}")]
+    GeoIp(String),
+
+    /// Sprint 7 P1 — distinct from `GeoIp(...)` so callers can
+    /// surface MaxMind setup instructions to the examiner without
+    /// string-matching error messages. The MaxMind license bars
+    /// VERIFY from auto-downloading the GeoLite2 database, so
+    /// "not configured" is a first-class state.
+    #[error("geoip database not configured: {0}")]
+    GeoIpNotConfigured(String),
 }
