@@ -317,6 +317,14 @@ enum Command {
         /// (`.csv` → CSV, `.html`/`.htm` → HTML, else JSON).
         #[arg(long, value_enum, default_value_t = CliReportFormat::Auto)]
         format: CliReportFormat,
+
+        /// Sprint 8 P2 — translate every detected foreign-language
+        /// file (any non-`--target` language) rather than skipping
+        /// non-foreign files. Default behavior is unchanged when
+        /// the flag is absent (only files whose detected language
+        /// differs from `--target` get translated).
+        #[arg(long, default_value_t = false)]
+        all_foreign: bool,
     },
 }
 
@@ -457,6 +465,7 @@ fn run(
             preset,
             config,
             format,
+            all_foreign,
         } => cmd_batch(
             &input,
             &target,
@@ -468,6 +477,7 @@ fn run(
             translation_backend,
             config.as_deref(),
             format,
+            all_foreign,
         ),
         Command::Config { action } => cmd_config(action),
     }
@@ -572,6 +582,16 @@ struct ResolvedSource {
     /// What kind of input this was — used by the printer to label
     /// the section ("Transcript" vs "Extracted text" vs "Source").
     kind_label: &'static str,
+    /// Sprint 8 P3 — the path pyannote should read for speaker
+    /// diarization. `Some(input)` for audio, `Some(scratch_wav)`
+    /// for video (scratch survives until diarization completes —
+    /// see cleanup in `cmd_translate`). `None` for text / image /
+    /// PDF inputs that have no audio track.
+    audio_path: Option<PathBuf>,
+    /// `true` when `audio_path` is a temp file the CLI owns and
+    /// must remove after diarization runs. `false` for audio
+    /// inputs (the original file belongs to the examiner).
+    audio_path_is_scratch: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -604,6 +624,8 @@ fn cmd_translate(
                 upstream_confidence: cr.confidence,
                 segments: None,
                 kind_label: "text",
+                audio_path: None,
+                audio_path_is_scratch: false,
             }
         }
         (None, None, Some(img)) => resolve_image_input(img, ocr_lang)?,
@@ -643,22 +665,34 @@ fn cmd_translate(
     // Optional diarization step. Only applies when the source had
     // STT segments (audio / video). Text / image / PDF inputs
     // ignore the flag entirely — there's no audio to attribute.
-    let diarization_segments: Option<Vec<DiarizationSegment>> =
-        if diarize && resolved.segments.is_some() {
-            let path = resolved_path.as_deref().ok_or_else(|| {
-                VerifyError::InvalidInput(
-                    "--diarize requires --input <audio|video>".to_string(),
-                )
-            })?;
-            Some(run_diarization(path)?)
-        } else {
-            if diarize {
-                println_verify(
-                    "--diarize ignored: input does not produce timestamped audio segments.",
-                );
-            }
-            None
-        };
+    // Sprint 8 P3: prefer the scratch WAV the video resolver
+    // extracted (pyannote reads audio, not video containers).
+    let diarization_segments: Option<Vec<DiarizationSegment>> = if diarize
+        && resolved.segments.is_some()
+    {
+        let audio_for_pyannote = resolved.audio_path.as_deref().or(resolved_path.as_deref());
+        let path = audio_for_pyannote.ok_or_else(|| {
+            VerifyError::InvalidInput(
+                "--diarize requires --input <audio|video>".to_string(),
+            )
+        })?;
+        Some(run_diarization(path)?)
+    } else {
+        if diarize {
+            println_verify(
+                "--diarize ignored: input does not produce timestamped audio segments.",
+            );
+        }
+        None
+    };
+
+    // Clean up the video scratch WAV. Diarization is already done
+    // (or was skipped); the scratch is no longer needed.
+    if resolved.audio_path_is_scratch {
+        if let Some(p) = &resolved.audio_path {
+            let _ = std::fs::remove_file(p);
+        }
+    }
 
     match (&resolved.segments, &diarization_segments, resolved.kind_label) {
         (Some(stt), Some(diar), _) => {
@@ -735,10 +769,25 @@ fn cmd_translate(
             ));
         }
         print_advisory(&translation);
+        // Sprint 8 P3 — speaker advisory always fires alongside
+        // (NOT instead of) the MT advisory whenever the
+        // transcript carries diarization-derived speaker labels.
+        print_speaker_advisory();
     } else {
         print_translation(&translation);
     }
     Ok(())
+}
+
+fn print_speaker_advisory() {
+    println_verify("");
+    println_verify("⚠  SPEAKER DIARIZATION NOTICE");
+    for line in verify_stt::SPEAKER_DIARIZATION_ADVISORY
+        .split_terminator(". ")
+        .filter(|s| !s.is_empty())
+    {
+        println_verify(format!("   {}", line.trim()));
+    }
 }
 
 fn run_diarization(audio: &std::path::Path) -> Result<Vec<DiarizationSegment>, VerifyError> {
@@ -1001,15 +1050,25 @@ fn resolve_path_input(
             let scratch = std::env::temp_dir().join("verify").join("video-scratch");
             println_verify("Input type: Video — extracting audio track via ffmpeg...");
             let audio = extract_audio_from_video(&p, &scratch)?;
-            let stt = try_run_stt(&audio, preset);
-            let _ = std::fs::remove_file(&audio);
-            let stt = stt?;
+            let stt = match try_run_stt(&audio, preset) {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = std::fs::remove_file(&audio);
+                    return Err(e);
+                }
+            };
+            // Keep the scratch WAV alive — diarization (if the
+            // examiner passes --diarize) needs to read it. The
+            // CLI cleans it up after the diarization step
+            // (or unconditionally on the non-diarize path).
             Ok(ResolvedSource {
                 text: stt.transcript,
                 upstream_lang: stt.detected_language,
                 upstream_confidence: stt.confidence,
                 segments: Some(stt.segments),
                 kind_label: "video",
+                audio_path: Some(audio),
+                audio_path_is_scratch: true,
             })
         }
         PipelineInput::Audio(p) => {
@@ -1021,6 +1080,8 @@ fn resolve_path_input(
                 upstream_confidence: stt.confidence,
                 segments: Some(stt.segments),
                 kind_label: "audio",
+                audio_path: Some(p),
+                audio_path_is_scratch: false,
             })
         }
         PipelineInput::Image(p) => {
@@ -1056,6 +1117,8 @@ fn resolve_pdf_input(
         upstream_confidence: 0.0,
         segments: None,
         kind_label: "pdf",
+        audio_path: None,
+        audio_path_is_scratch: false,
     })
 }
 
@@ -1073,6 +1136,8 @@ fn resolve_image_input(
         upstream_confidence: ocr.confidence,
         segments: None,
         kind_label: "image",
+        audio_path: None,
+        audio_path_is_scratch: false,
     })
 }
 
@@ -1121,8 +1186,19 @@ fn cmd_batch(
     translation_backend: TranslationBackend,
     config_path: Option<&std::path::Path>,
     format: CliReportFormat,
+    all_foreign: bool,
 ) -> Result<(), VerifyError> {
     let config = load_report_config(config_path)?;
+    if all_foreign {
+        // The Sprint 8 default already classifies and translates
+        // every non-`--target` file. The flag is plumbed for
+        // examiner-intent clarity and to surface a leading log
+        // line so the run banner reflects what the operator
+        // asked for.
+        println_verify(
+            "Mode: --all-foreign — every detected non-target language will be translated.",
+        );
+    }
     if !input.exists() || !input.is_dir() {
         return Err(VerifyError::InvalidInput(format!(
             "batch --input must be a directory, got {input:?}"
@@ -1273,9 +1349,12 @@ fn cmd_batch(
         machine_translation_notice: MACHINE_TRANSLATION_NOTICE.to_string(),
         results,
         summary: None,
+        language_groups: Vec::new(),
+        dominant_language: None,
     };
     let summary = report.build_summary(elapsed, MACHINE_TRANSLATION_NOTICE);
     report.summary = Some(summary);
+    report.build_language_groups();
     report.assert_advisory()?;
 
     println_verify(format!(

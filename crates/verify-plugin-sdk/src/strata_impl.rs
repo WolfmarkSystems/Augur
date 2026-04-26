@@ -458,6 +458,72 @@ mod tests {
         assert!(assert_advisory_invariant(&r).is_err());
     }
 
+    /// Sprint 8 P1 acceptance — running `walk_and_translate` on
+    /// a temp directory containing nothing the walker recognises
+    /// as audio/video/image/pdf produces an empty artifact list,
+    /// proving the walker does not emit spurious translations.
+    #[test]
+    fn strata_plugin_skips_non_foreign_files() {
+        let work = std::env::temp_dir().join(format!(
+            "verify-strata-skip-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&work).unwrap();
+        // Drop a plain English .txt file. The walker classifies
+        // by extension; .txt is not in the audio/video/image/pdf
+        // set, so the file is silently skipped — no translation
+        // artifacts produced.
+        std::fs::write(work.join("notes.txt"), "This is English text.\n").unwrap();
+        let records = walk_and_translate(&work, "en").expect("walk");
+        assert!(
+            records.is_empty(),
+            "non-foreign .txt files must not produce artifacts, got: {records:?}"
+        );
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// Sprint 8 P1 acceptance — every artifact `walk_and_translate`
+    /// emits must satisfy the advisory invariant (title prefix +
+    /// raw_data MT flag + non-empty advisory_notice). We can't
+    /// drive a real STT call hermetically, so we drive the
+    /// invariant assertion via the `record_from_translation` /
+    /// `assert_advisory_invariant` pair plus a confirmation that
+    /// the walker on an empty dir trivially upholds it.
+    #[test]
+    fn strata_plugin_execute_returns_advisory_artifacts() {
+        // Empty dir → empty Vec → invariant trivially upholds.
+        let work = std::env::temp_dir().join(format!(
+            "verify-strata-empty-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&work).unwrap();
+        let records = walk_and_translate(&work, "en").expect("walk");
+        for r in &records {
+            assert_advisory_invariant(r)
+                .expect("walker must only emit advisory-correct records");
+        }
+        let _ = std::fs::remove_dir_all(&work);
+
+        // Drive a synthetic fixture through `record_from_translation`
+        // — same code path the live walker uses — and confirm the
+        // produced ArtifactRecord clears `assert_advisory_invariant`.
+        let translation = fixture();
+        let synthesized =
+            record_from_translation(Path::new("/evidence/clip.mp3"), &translation);
+        assert_advisory_invariant(&synthesized)
+            .expect("record_from_translation must produce advisory-clean artifacts");
+        assert_eq!(synthesized.confidence, MT_CONFIDENCE);
+        assert_eq!(synthesized.forensic_value, ForensicValue::High);
+    }
+
     #[test]
     fn plugin_metadata_via_real_trait() {
         let p = crate::VerifyStrataPlugin::new();

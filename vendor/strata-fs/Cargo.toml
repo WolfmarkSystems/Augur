@@ -1,0 +1,10 @@
+[package]
+name = "strata-fs"
+version = "0.0.0-stub"
+edition = "2021"
+license = "Proprietary"
+description = "Minimal `strata-fs` stub vendored alongside `strata-plugin-sdk` so VERIFY's `--features verify-plugin-sdk/strata` build does not pull in the upstream NTFS/APFS/ext4/EWF parser tree."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+thiserror = "1"

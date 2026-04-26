@@ -10,7 +10,7 @@ pub mod whisper;
 
 pub use diarize::{
     merge_stt_with_diarization, DiarizationEngine, DiarizationSegment, EnrichedSegment,
-    HfTokenManager, DEFAULT_PYANNOTE_MODEL,
+    HfTokenManager, DEFAULT_PYANNOTE_MODEL, SPEAKER_DIARIZATION_ADVISORY,
 };
 pub use whisper::{
     compression_ratio, extract_audio_from_video, ModelManager, SttEngine, SttResult, SttSegment,

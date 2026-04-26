@@ -25,6 +25,17 @@ use verify_core::VerifyError;
 /// the [`DiarizationEngine::model`] field.
 pub const DEFAULT_PYANNOTE_MODEL: &str = "pyannote/speaker-diarization-3.1";
 
+/// Sprint 8 P3 — speaker-attribution advisory. Non-suppressible
+/// at the same level as the machine-translation advisory. Whenever
+/// the CLI prints a diarized transcript, this line MUST appear
+/// alongside the MT advisory. Speaker labels are produced by an
+/// automated voice-segmentation model; they are not biometric
+/// identification and must not be relied on as such.
+pub const SPEAKER_DIARIZATION_ADVISORY: &str =
+    "Speaker labels (SPEAKER_00, SPEAKER_01, ...) are produced by automated \
+     voice segmentation. Do NOT use these as definitive identification of \
+     individuals without expert verification.";
+
 const DIARIZE_SCRIPT: &str = include_str!("diarize.py");
 
 /// One contiguous span attributed to a single speaker by pyannote.
@@ -442,6 +453,97 @@ mod tests {
         match mgr.save("   ") {
             Err(VerifyError::InvalidInput(_)) => {}
             other => panic!("expected InvalidInput on empty token, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn video_diarization_pipeline_produces_enriched_segments() {
+        // Sprint 8 P3 — exercises the merge path that the video
+        // pipeline drives. Three STT segments, two speakers,
+        // verify the right speaker_id lands on each segment by
+        // maximum temporal overlap.
+        let stt = vec![
+            crate::SttSegment {
+                start_ms: 0,
+                end_ms: 5_000,
+                text: "مرحبا بالعالم".into(),
+            },
+            crate::SttSegment {
+                start_ms: 5_000,
+                end_ms: 12_000,
+                text: "كيف حالك".into(),
+            },
+            crate::SttSegment {
+                start_ms: 12_000,
+                end_ms: 18_000,
+                text: "بخير شكرا".into(),
+            },
+        ];
+        let diar = vec![
+            DiarizationSegment {
+                start_ms: 0,
+                end_ms: 5_500,
+                speaker_id: "SPEAKER_00".into(),
+                speaker_label: None,
+            },
+            DiarizationSegment {
+                start_ms: 5_500,
+                end_ms: 12_000,
+                speaker_id: "SPEAKER_01".into(),
+                speaker_label: None,
+            },
+            DiarizationSegment {
+                start_ms: 12_000,
+                end_ms: 18_000,
+                speaker_id: "SPEAKER_00".into(),
+                speaker_label: None,
+            },
+        ];
+        let merged = merge_stt_with_diarization(&stt, &diar);
+        assert_eq!(merged.len(), 3);
+        assert_eq!(merged[0].speaker_id, "SPEAKER_00");
+        assert_eq!(merged[1].speaker_id, "SPEAKER_01");
+        assert_eq!(merged[2].speaker_id, "SPEAKER_00");
+        // The translated_text slot is left None — the CLI fills
+        // it after running NLLB on each segment.
+        for m in &merged {
+            assert!(m.translated_text.is_none());
+            assert!(!m.text.is_empty());
+        }
+    }
+
+    #[test]
+    fn speaker_advisory_always_present_when_diarization_used() {
+        // Sprint 8 P3 — the speaker-diarization advisory const
+        // must be non-empty and carry both sides of the warning
+        // (automated nature + don't use as biometric ID).
+        assert!(!SPEAKER_DIARIZATION_ADVISORY.is_empty());
+        assert!(SPEAKER_DIARIZATION_ADVISORY.contains("automated"));
+        assert!(SPEAKER_DIARIZATION_ADVISORY.contains("identification"));
+    }
+
+    #[test]
+    fn video_without_diarization_still_produces_transcript() {
+        // Sprint 8 P3 — when diarization isn't run (empty diar
+        // vector), every STT segment is still emitted, just
+        // labeled UNKNOWN. The transcript itself is never lost.
+        let stt = vec![
+            crate::SttSegment {
+                start_ms: 0,
+                end_ms: 5_000,
+                text: "alpha".into(),
+            },
+            crate::SttSegment {
+                start_ms: 5_000,
+                end_ms: 10_000,
+                text: "beta".into(),
+            },
+        ];
+        let merged = merge_stt_with_diarization(&stt, &[]);
+        assert_eq!(merged.len(), 2);
+        for m in &merged {
+            assert_eq!(m.speaker_id, "UNKNOWN");
+            assert!(!m.text.is_empty());
         }
     }
 

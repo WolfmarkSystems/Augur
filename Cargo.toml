@@ -9,6 +9,14 @@ members = [
     "crates/verify-plugin-sdk",
     "apps/verify-cli",
 ]
+# Vendored Strata plugin SDK + minimal strata-fs stub
+# (Sprint 8 P1). Excluded from the workspace so they are NOT
+# built as part of `cargo build --workspace`; they're pulled in
+# only when `verify-plugin-sdk/strata` feature is on.
+exclude = [
+    "vendor/strata-plugin-sdk",
+    "vendor/strata-fs",
+]
 
 [workspace.package]
 version = "0.1.0"

@@ -267,13 +267,84 @@ pub fn render_batch_html(report: &BatchResult, config: &ReportConfig) -> String 
         out.push_str("</table>\n");
     }
 
-    // Per-file results.
-    out.push_str("<h2>Per-file results</h2>\n<table>\n<tr><th>File</th><th>Type</th><th>Lang</th>");
+    // Sprint 8 P2 — language summary block (counts + dominant
+    // foreign language) when the report carries grouping info.
+    if !report.language_groups.is_empty() {
+        out.push_str("<h2>Language summary</h2>\n<table>\n");
+        out.push_str("<tr><th>Code</th><th>Language</th><th>Files</th><th>Words</th></tr>\n");
+        for g in &report.language_groups {
+            out.push_str(&format!(
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>\n",
+                html_escape(&g.language_code),
+                html_escape(&g.language_name),
+                g.file_count,
+                g.total_words,
+            ));
+        }
+        out.push_str("</table>\n");
+        if let Some(dom) = &report.dominant_language {
+            out.push_str(&format!(
+                "<p>Dominant foreign language: <strong>{}</strong></p>\n",
+                html_escape(dom)
+            ));
+        }
+    }
+
+    // Per-language sections (Sprint 8 P2). When more than one
+    // language is detected, render each group with its own
+    // heading + per-group MT advisory so a printed copy still
+    // makes the advisory unmissable per section.
+    if report.language_groups.len() > 1 {
+        for g in &report.language_groups {
+            out.push_str(&format!(
+                "<h2>{} Evidence ({} files)</h2>\n",
+                html_escape(&g.language_name),
+                g.file_count,
+            ));
+            out.push_str(&format!(
+                "<div class=\"advisory\">⚠ MACHINE TRANSLATION NOTICE — {}</div>\n",
+                html_escape(&report.machine_translation_notice),
+            ));
+            push_results_table(&mut out, &g.files, config);
+        }
+    }
+
+    // Per-file results (full table — emitted always, including
+    // when per-language sections rendered above; the global
+    // table is the canonical row-by-row reference).
+    out.push_str("<h2>Per-file results</h2>\n");
+    push_results_table(&mut out, &report.results, config);
+
+    // Bottom advisory — always present.
+    out.push_str(&format!(
+        "<div class=\"advisory\">⚠ MACHINE TRANSLATION NOTICE — {}</div>\n",
+        html_escape(&report.machine_translation_notice),
+    ));
+
+    if config.include_language_limitations {
+        out.push_str("<footer><p>For known classifier limitations \
+                      (Pashto/Persian confusion, short-text reliability) \
+                      see <code>docs/LANGUAGE_LIMITATIONS.md</code> in \
+                      the VERIFY repository.</p></footer>\n");
+    }
+
+    out.push_str(HTML_TAIL);
+    out
+}
+
+/// Helper used by both the global per-file table and the
+/// per-language sections (Sprint 8 P2).
+fn push_results_table(
+    out: &mut String,
+    files: &[crate::pipeline::BatchFileResult],
+    config: &ReportConfig,
+) {
+    out.push_str("<table>\n<tr><th>File</th><th>Type</th><th>Lang</th>");
     if config.include_confidence_tiers {
         out.push_str("<th>Confidence</th>");
     }
     out.push_str("<th>Foreign?</th><th>Source</th><th>Translation</th></tr>\n");
-    for r in &report.results {
+    for r in files {
         let row_class = if r.error.is_some() {
             "errored"
         } else if r.is_foreign {
@@ -315,22 +386,6 @@ pub fn render_batch_html(report: &BatchResult, config: &ReportConfig) -> String 
         ));
     }
     out.push_str("</table>\n");
-
-    // Bottom advisory — always present.
-    out.push_str(&format!(
-        "<div class=\"advisory\">⚠ MACHINE TRANSLATION NOTICE — {}</div>\n",
-        html_escape(&report.machine_translation_notice),
-    ));
-
-    if config.include_language_limitations {
-        out.push_str("<footer><p>For known classifier limitations \
-                      (Pashto/Persian confusion, short-text reliability) \
-                      see <code>docs/LANGUAGE_LIMITATIONS.md</code> in \
-                      the VERIFY repository.</p></footer>\n");
-    }
-
-    out.push_str(HTML_TAIL);
-    out
 }
 
 fn push_meta_row(buf: &mut String, label: &str, value: Option<&str>) {
@@ -373,6 +428,8 @@ mod tests {
             errors: 0,
             target_language: "en".into(),
             machine_translation_notice: "MT — verify with human translator.".into(),
+            language_groups: Vec::new(),
+            dominant_language: None,
             results: vec![BatchFileResult {
                 file_path: "/ev/a.mp3".into(),
                 input_type: "audio".into(),
@@ -476,6 +533,44 @@ mod tests {
         let html = render_batch_html(&empty_report(), &cfg);
         assert!(!html.contains("<script>"), "user strings must be escaped");
         assert!(html.contains("Acme&lt;script&gt;"));
+    }
+
+    #[test]
+    fn html_renders_per_language_sections_with_advisory_each() {
+        // Sprint 8 P2 — when the report carries multiple language
+        // groups, the HTML renderer emits a per-group section
+        // with its own MT advisory line, plus the dominant-
+        // language summary block.
+        let mut report = empty_report();
+        report.language_groups = vec![
+            crate::pipeline::LanguageGroup {
+                language_code: "ar".into(),
+                language_name: "Arabic".into(),
+                file_count: 8,
+                total_words: 1247,
+                files: report.results.clone(),
+            },
+            crate::pipeline::LanguageGroup {
+                language_code: "zh".into(),
+                language_name: "Chinese".into(),
+                file_count: 3,
+                total_words: 445,
+                files: report.results.clone(),
+            },
+        ];
+        report.dominant_language = Some("ar".into());
+        let html = render_batch_html(&report, &ReportConfig::blank());
+        assert!(html.contains("Arabic Evidence (8 files)"));
+        assert!(html.contains("Chinese Evidence (3 files)"));
+        assert!(html.contains("Language summary"));
+        assert!(html.contains("Dominant foreign language"));
+        // Each section emits its own advisory; combined with top
+        // + bottom the count must be ≥ 4 (top + 2 sections + bottom).
+        let n = html.matches("MACHINE TRANSLATION NOTICE").count();
+        assert!(
+            n >= 4,
+            "expected ≥4 MT advisories (top + per-section + bottom), got {n}"
+        );
     }
 
     #[test]

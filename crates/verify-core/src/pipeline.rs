@@ -107,6 +107,47 @@ impl PipelineResult {
     }
 }
 
+/// English-language display name for an ISO 639-1 code. Falls
+/// back to the code itself when unmapped — the report should
+/// degrade gracefully rather than panic on novel codes.
+pub fn language_name_for(iso: &str) -> &'static str {
+    match iso {
+        "ar" => "Arabic",
+        "zh" => "Chinese",
+        "ru" => "Russian",
+        "es" => "Spanish",
+        "fr" => "French",
+        "de" => "German",
+        "ko" => "Korean",
+        "ja" => "Japanese",
+        "vi" => "Vietnamese",
+        "tr" => "Turkish",
+        "pt" => "Portuguese",
+        "it" => "Italian",
+        "nl" => "Dutch",
+        "he" => "Hebrew",
+        "hi" => "Hindi",
+        "id" => "Indonesian",
+        "pl" => "Polish",
+        "uk" => "Ukrainian",
+        "fa" => "Persian (Farsi)",
+        "ps" => "Pashto",
+        "ur" => "Urdu",
+        "en" => "English",
+        "sv" => "Swedish",
+        "fi" => "Finnish",
+        "no" => "Norwegian",
+        "da" => "Danish",
+        "cs" => "Czech",
+        "el" => "Greek",
+        "ro" => "Romanian",
+        "hu" => "Hungarian",
+        "th" => "Thai",
+        "bg" => "Bulgarian",
+        _ => "(unknown)",
+    }
+}
+
 // ── Batch processing types ──────────────────────────────────────
 //
 // Sprint 3: VERIFY can process an entire directory in one
@@ -179,6 +220,25 @@ pub struct BatchSummary {
     pub machine_translation_notice: String,
 }
 
+/// Sprint 8 P2 — per-language grouping for a multi-language
+/// evidence directory. The CLI populates this on top of the
+/// flat `results` list whenever `--all-foreign` (or any input
+/// produced multiple detected languages); existing consumers
+/// reading only `results` continue to work.
+#[derive(Debug, Clone, Serialize)]
+pub struct LanguageGroup {
+    /// ISO 639-1 code (`"ar"`, `"zh"`, …).
+    pub language_code: String,
+    /// English-language display name (`"Arabic"`, `"Chinese"`, …).
+    pub language_name: String,
+    pub file_count: u32,
+    /// Approximate total source-text word count across this
+    /// group's files. Whitespace-tokenized; good enough for an
+    /// "amount of evidence" gauge.
+    pub total_words: u32,
+    pub files: Vec<BatchFileResult>,
+}
+
 /// Top-level batch report. Always carries the
 /// `machine_translation_notice` so consumers of the JSON cannot
 /// strip the advisory by accident — it is not optional.
@@ -202,6 +262,15 @@ pub struct BatchResult {
     /// older consumers parsing pre-Sprint-6 reports still work.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<BatchSummary>,
+    /// Sprint 8 P2 — per-language file groupings. Empty when only
+    /// one language is detected (or when no foreign files were
+    /// processed).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub language_groups: Vec<LanguageGroup>,
+    /// Sprint 8 P2 — most common detected foreign language across
+    /// the batch. `None` when there are no foreign files.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dominant_language: Option<String>,
 }
 
 impl BatchResult {
@@ -225,6 +294,61 @@ impl BatchResult {
             }
         }
         Ok(())
+    }
+
+    /// Sprint 8 P2 — populate `language_groups` and
+    /// `dominant_language` from the per-file `results`. Idempotent
+    /// (overwrites whatever was there). Files with no detected
+    /// language are skipped; English (`target_language` matches)
+    /// is included so the report shows "ar: 8, zh: 3, en: 5".
+    pub fn build_language_groups(&mut self) {
+        use std::collections::BTreeMap;
+        let mut buckets: BTreeMap<String, Vec<BatchFileResult>> = BTreeMap::new();
+        for r in &self.results {
+            if r.detected_language.is_empty() {
+                continue;
+            }
+            buckets
+                .entry(r.detected_language.clone())
+                .or_default()
+                .push(r.clone());
+        }
+        let mut groups: Vec<LanguageGroup> = buckets
+            .into_iter()
+            .map(|(code, files)| {
+                let total_words: u32 = files
+                    .iter()
+                    .map(|f| {
+                        f.source_text
+                            .as_deref()
+                            .map(|t| t.split_whitespace().count() as u32)
+                            .unwrap_or(0)
+                    })
+                    .sum();
+                let language_name = language_name_for(&code).to_string();
+                LanguageGroup {
+                    file_count: files.len() as u32,
+                    total_words,
+                    language_code: code,
+                    language_name,
+                    files,
+                }
+            })
+            .collect();
+        // Sort by file_count desc, then code asc for determinism.
+        groups.sort_by(|a, b| {
+            b.file_count
+                .cmp(&a.file_count)
+                .then_with(|| a.language_code.cmp(&b.language_code))
+        });
+        // Dominant *foreign* language — exclude target.
+        let target = self.target_language.clone();
+        self.dominant_language = groups
+            .iter()
+            .filter(|g| g.language_code != target)
+            .max_by_key(|g| g.file_count)
+            .map(|g| g.language_code.clone());
+        self.language_groups = groups;
     }
 
     /// Build a [`BatchSummary`] from `self` plus the wall-clock
@@ -471,6 +595,8 @@ mod tests {
             machine_translation_notice: "Machine translation — verify.".into(),
             results: vec![r1, r2, r3, r4, r5],
             summary: None,
+            language_groups: Vec::new(),
+            dominant_language: None,
         }
     }
 
@@ -487,6 +613,8 @@ mod tests {
             machine_translation_notice: String::new(),
             results: vec![],
             summary: None,
+            language_groups: Vec::new(),
+            dominant_language: None,
         };
         assert!(r.assert_advisory().is_err());
     }
@@ -504,6 +632,8 @@ mod tests {
             machine_translation_notice: "advisory present".into(),
             results: vec![],
             summary: None,
+            language_groups: Vec::new(),
+            dominant_language: None,
         };
         assert!(r.assert_advisory().is_ok());
     }
@@ -521,6 +651,8 @@ mod tests {
             machine_translation_notice: "x".into(),
             results: vec![],
             summary: None,
+            language_groups: Vec::new(),
+            dominant_language: None,
         };
         assert_eq!(r.total_files, r.processed + r.errors);
     }
@@ -573,6 +705,121 @@ mod tests {
         let r = fixture_with_results(3);
         let s = r.build_summary(0.0, &r.machine_translation_notice);
         assert!(!s.machine_translation_notice.is_empty());
+    }
+
+    #[test]
+    fn language_groups_correctly_populated() {
+        // 3 Arabic, 2 Chinese, 1 errored. The errored row drops
+        // out (no detected_language); the remaining 5 fan into
+        // 2 groups, sorted by file count descending.
+        let mut r = BatchResult {
+            generated_at: "2026-04-26T00:00:00Z".into(),
+            total_files: 6,
+            processed: 5,
+            foreign_language: 5,
+            translated: 5,
+            errors: 1,
+            target_language: "en".into(),
+            machine_translation_notice: "MT.".into(),
+            results: vec![
+                make_row("/ev/a.mp3", "ar", true, Some("alpha"), Some("alpha"), None),
+                make_row("/ev/b.mp3", "ar", true, Some("beta"), Some("beta"), None),
+                make_row("/ev/c.mp3", "ar", true, Some("gamma"), Some("gamma"), None),
+                make_row("/ev/d.mp3", "zh", true, Some("delta"), Some("delta"), None),
+                make_row("/ev/e.mp3", "zh", true, Some("epsilon"), Some("epsilon"), None),
+                make_row("/ev/f.mp3", "", false, None, None, Some("error")),
+            ],
+            summary: None,
+            language_groups: Vec::new(),
+            dominant_language: None,
+        };
+        r.build_language_groups();
+        assert_eq!(r.language_groups.len(), 2);
+        assert_eq!(r.language_groups[0].language_code, "ar");
+        assert_eq!(r.language_groups[0].language_name, "Arabic");
+        assert_eq!(r.language_groups[0].file_count, 3);
+        assert_eq!(r.language_groups[1].language_code, "zh");
+        assert_eq!(r.language_groups[1].file_count, 2);
+        // Total words across the Arabic group: 3 source words.
+        assert_eq!(r.language_groups[0].total_words, 3);
+    }
+
+    #[test]
+    fn dominant_language_is_most_frequent_foreign() {
+        // 5 Arabic, 2 Chinese, 1 Russian, 4 English (target).
+        // Dominant *foreign* must be Arabic — English excluded
+        // because it's the target_language.
+        let mut r = BatchResult {
+            generated_at: "2026-04-26T00:00:00Z".into(),
+            total_files: 12,
+            processed: 12,
+            foreign_language: 8,
+            translated: 8,
+            errors: 0,
+            target_language: "en".into(),
+            machine_translation_notice: "MT.".into(),
+            results: (0..5)
+                .map(|i| make_row(&format!("/a/{i}"), "ar", true, Some("x"), Some("X"), None))
+                .chain((0..2).map(|i| {
+                    make_row(&format!("/z/{i}"), "zh", true, Some("y"), Some("Y"), None)
+                }))
+                .chain(std::iter::once(make_row(
+                    "/r/1", "ru", true, Some("r"), Some("R"), None,
+                )))
+                .chain((0..4).map(|i| {
+                    make_row(&format!("/e/{i}"), "en", false, Some("hi"), None, None)
+                }))
+                .collect(),
+            summary: None,
+            language_groups: Vec::new(),
+            dominant_language: None,
+        };
+        r.build_language_groups();
+        assert_eq!(r.dominant_language.as_deref(), Some("ar"));
+        // The English group is still listed; it just isn't the
+        // dominant *foreign* language.
+        assert!(r
+            .language_groups
+            .iter()
+            .any(|g| g.language_code == "en"));
+    }
+
+    #[test]
+    fn dominant_language_is_none_when_no_foreign() {
+        let mut r = BatchResult {
+            generated_at: "2026-04-26T00:00:00Z".into(),
+            total_files: 1,
+            processed: 1,
+            foreign_language: 0,
+            translated: 0,
+            errors: 0,
+            target_language: "en".into(),
+            machine_translation_notice: "MT.".into(),
+            results: vec![make_row(
+                "/e/1", "en", false, Some("hello"), None, None,
+            )],
+            summary: None,
+            language_groups: Vec::new(),
+            dominant_language: None,
+        };
+        r.build_language_groups();
+        assert!(r.dominant_language.is_none());
+    }
+
+    #[test]
+    fn language_name_for_covers_forensic_languages() {
+        for (iso, expected) in &[
+            ("ar", "Arabic"),
+            ("fa", "Persian (Farsi)"),
+            ("ps", "Pashto"),
+            ("ur", "Urdu"),
+            ("zh", "Chinese"),
+            ("en", "English"),
+        ] {
+            assert_eq!(language_name_for(iso), *expected);
+        }
+        // Unknown ISO falls through to the sentinel.
+        assert_eq!(language_name_for("xx"), "(unknown)");
     }
 
     #[test]

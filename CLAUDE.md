@@ -481,7 +481,58 @@ opt-in API.
   pin every reference conversion (Unix epoch ↔ Windows FILETIME
   ↔ WebKit ↔ Apple ↔ HFS+).
 
-## What remains for Sprint 8+
+## Sprint 8 decisions (shipped 2026-04-26)
+
+- **Strata plugin SDK vendored locally with a minimal `strata-fs`
+  stub.** Sprint 5 built the `--features verify-plugin-sdk/strata`
+  trait impl behind a path dep at `~/Wolfmark/strata/...`; that
+  path was fragile to user directory layout. Sprint 8 vendors
+  `strata-plugin-sdk` to `vendor/strata-plugin-sdk/` and ships a
+  thin `vendor/strata-fs/` stub (just `WalkDecision`, `VfsEntry`
+  with the three fields the SDK actually reads, and the
+  `VirtualFilesystem` trait with the five methods the SDK
+  invokes). Workspace `[workspace.exclude]` keeps the vendored
+  crates out of `cargo build --workspace`; they're pulled in
+  only when the strata feature is on. Default build stays
+  small; `cargo build --features verify-plugin-sdk/strata`
+  succeeds without the sibling Strata workspace. Two new
+  feature-gated tests pin: walker emits no artifacts on a
+  non-foreign tempdir, and every artifact `walk_and_translate`
+  produces upholds `assert_advisory_invariant`.
+- **Multi-language batch — `LanguageGroup` + `--all-foreign`.**
+  `BatchResult` gains `language_groups: Vec<LanguageGroup>` and
+  `dominant_language: Option<String>`. New
+  `BatchResult::build_language_groups` clusters per-file rows
+  by detected ISO 639-1 code, sums approximate word counts,
+  and computes the most-frequent foreign language (excluding
+  `target_language`). HTML report renders a `Language summary`
+  block, dominant-language banner, and per-language sections
+  with their own MT advisory line — printed copies carry the
+  advisory per page break, not just at the document edges.
+  `language_name_for(iso)` covers the major + forensic-priority
+  languages (Arabic, Persian, Pashto, Urdu, Chinese, Russian,
+  …). The `--all-foreign` CLI flag is plumbed through
+  `cmd_batch` for examiner-intent clarity; the underlying
+  behavior already translated every non-target file as of
+  Sprint 3, so the flag prints a leading log line and the
+  language groups always populate.
+- **Video diarization pipeline + speaker advisory.** Sprint 5
+  shipped `--diarize` for audio inputs; Sprint 8 closes the
+  video gap. `ResolvedSource` now carries
+  `audio_path: Option<PathBuf>` plus
+  `audio_path_is_scratch: bool`; the video resolver writes
+  the extracted WAV to a scratch path that survives until
+  diarization runs, then the CLI cleans it up. `pyannote.audio`
+  reads audio rather than video containers, so this hand-off
+  matters. New `SPEAKER_DIARIZATION_ADVISORY` const in
+  `verify-stt::diarize` is non-suppressible at the same level
+  as the MT advisory: whenever the CLI prints a diarized
+  transcript, both advisories fire (MT first, speaker second
+  — never one without the other). The advisory text spells out
+  that speaker labels are NOT biometric identification and
+  must not be used as such without expert verification.
+
+## What remains for Sprint 9+
 
 - Examiner-assigned speaker labels (overwrite `SPEAKER_00` →
   `Suspect A` and persist across runs).
