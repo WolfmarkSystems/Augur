@@ -6,9 +6,18 @@ import Toolbar from "./components/Toolbar";
 import StatusBar from "./components/StatusBar";
 import WorkspaceDoc from "./components/WorkspaceDoc";
 import WorkspaceAudio from "./components/WorkspaceAudio";
+import WorkspaceBatch from "./components/WorkspaceBatch";
 import ModelManager from "./components/ModelManager";
+import ErrorBanner, { type ErrorBannerType } from "./components/ErrorBanner";
+import { invoke } from "@tauri-apps/api/core";
 import {
+  augurBinaryPath,
+  checkAugurAvailable,
   mtAdvisoryText,
+  onBatchComplete,
+  onBatchError,
+  onBatchFileDone,
+  onBatchFileStart,
   onCodeSwitchDetected,
   onDialectDetected,
   onSegmentReady,
@@ -38,10 +47,19 @@ export default function App() {
   const forceTranscript = useAppStore((s) => s.forceTranscriptView);
   const caseNumber = useAppStore((s) => s.caseNumber);
   const setCaseNumber = useAppStore((s) => s.setCaseNumber);
+  const batch = useAppStore((s) => s.batch);
+  const onBatchFileStartStore = useAppStore((s) => s.onBatchFileStart);
+  const onBatchFileDoneStore = useAppStore((s) => s.onBatchFileDone);
+  const onBatchCompleteStore = useAppStore((s) => s.onBatchComplete);
+  const setAugurAvailable = useAppStore((s) => s.setAugurAvailable);
+  const augurAvailable = useAppStore((s) => s.augurAvailable);
 
   const [showModelManager, setShowModelManager] = useState(false);
   const [showAdvisory, setShowAdvisory] = useState(false);
   const [advisoryText, setAdvisoryText] = useState<string>(MT_ADVISORY_FALLBACK);
+  const [bannerType, setBannerType] = useState<ErrorBannerType | null>(null);
+  const [bannerMessage, setBannerMessage] = useState<string | undefined>();
+  const setSelfTestFailsStore = useAppStore((s) => s.setSelfTestFails);
 
   // Subscribe to pipeline events once on mount.
   useEffect(() => {
@@ -75,9 +93,69 @@ export default function App() {
       void p.total_segments;
     }).then((u) => unlisten.push(u));
     onTranslationError((p) => {
+      const msg = p.message ?? p.error ?? "Translation failed";
       setIsTranslating(false);
-      setError(p.error);
+      setError(msg);
+      setBannerType("translation-failed");
+      setBannerMessage(msg);
     }).then((u) => unlisten.push(u));
+    onBatchFileStart((p) =>
+      onBatchFileStartStore(p.file, p.input_type, p.total),
+    ).then((u) => unlisten.push(u));
+    onBatchFileDone((p) =>
+      onBatchFileDoneStore({
+        path: p.file,
+        inputType: p.input_type,
+        detectedLanguage: p.detected_language,
+        isForeign: p.is_foreign,
+        translated: p.translated,
+        error: p.error,
+        status: p.error ? "error" : "done",
+      }),
+    ).then((u) => unlisten.push(u));
+    onBatchComplete((p) =>
+      onBatchCompleteStore({
+        total: p.total_files,
+        processed: p.processed,
+        foreign: p.foreign_files,
+        translated: p.translated,
+        errors: p.errors,
+      }),
+    ).then((u) => unlisten.push(u));
+    onBatchError((p) => setError(`Batch failed: ${p.message}`)).then((u) =>
+      unlisten.push(u),
+    );
+    // Sprint 13 P4 — startup probe for the augur CLI + non-
+    // blocking self-test. Surfaces the four error states named
+    // in the sprint spec.
+    Promise.all([checkAugurAvailable(), augurBinaryPath()])
+      .then(([avail, path]) => {
+        setAugurAvailable(avail, path);
+        if (!avail) {
+          setBannerType("cli-not-found");
+          setBannerMessage(undefined);
+          return;
+        }
+        // CLI present — kick off the self-test. Failures stay
+        // in the status bar; we only escalate to the banner on
+        // a hard "models missing" pattern.
+        invoke<string[]>("run_startup_self_test")
+          .then((fails) => {
+            setSelfTestFailsStore(fails);
+            const modelsMissing = fails.some((f) =>
+              f.toLowerCase().includes("not cached"),
+            );
+            if (modelsMissing && fails.length > 1) {
+              setBannerType("models-missing");
+              setBannerMessage(fails.slice(0, 3).join("\n"));
+            }
+          })
+          .catch(() => {
+            // self-test failure is non-fatal; clear the list.
+            setSelfTestFailsStore([]);
+          });
+      })
+      .catch(() => setAugurAvailable(false, null));
     mtAdvisoryText()
       .then((t) => setAdvisoryText(t))
       .catch(() => setAdvisoryText(MT_ADVISORY_FALLBACK));
@@ -90,6 +168,11 @@ export default function App() {
     setActiveEngine,
     setProgress,
     setError,
+    onBatchFileStartStore,
+    onBatchFileDoneStore,
+    onBatchCompleteStore,
+    setAugurAvailable,
+    setSelfTestFailsStore,
   ]);
 
   // Whenever a new file is loaded, kick off translation.
@@ -144,9 +227,42 @@ export default function App() {
         }}
       />
       <Toolbar />
+      <ErrorBanner
+        type={bannerType}
+        message={bannerMessage}
+        onDismiss={() => {
+          setBannerType(null);
+          setBannerMessage(undefined);
+        }}
+        actionLabel={
+          bannerType === "models-missing" || bannerType === "translation-failed"
+            ? "Open Model Manager"
+            : undefined
+        }
+        onAction={
+          bannerType === "models-missing" || bannerType === "translation-failed"
+            ? () => {
+                setShowModelManager(true);
+                setBannerType(null);
+              }
+            : undefined
+        }
+      />
       <main className="app-body">
-        {useAudioWorkspace ? <WorkspaceAudio /> : <WorkspaceDoc />}
+        {batch ? (
+          <WorkspaceBatch />
+        ) : useAudioWorkspace ? (
+          <WorkspaceAudio />
+        ) : (
+          <WorkspaceDoc />
+        )}
       </main>
+      {augurAvailable === false && bannerType !== "cli-not-found" && (
+        <div className="cli-banner" role="alert">
+          ⚠ AUGUR CLI not found on this system. Run the AUGUR Installer or
+          install via <code>cargo install augur</code>.
+        </div>
+      )}
       <StatusBar />
 
       <ModelManager

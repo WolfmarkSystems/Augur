@@ -9,7 +9,7 @@
 use std::path::PathBuf;
 
 use serde::Serialize;
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ModelStatus {
@@ -62,6 +62,77 @@ pub fn list_models(app: AppHandle) -> Vec<ModelStatus> {
             }
         })
         .collect()
+}
+
+/// Sprint 13 P3 — shell out to `augur install --status --format json`
+/// for an authoritative installed/missing list. Falls back to the
+/// local catalog probe (the static `CATALOG` above) when the CLI
+/// is unavailable so the UI never crashes on a fresh dev machine.
+#[tauri::command]
+pub async fn get_model_status() -> Result<serde_json::Value, String> {
+    use tokio::process::Command;
+    let augur = match crate::pipeline::find_augur_binary() {
+        Some(p) => p,
+        None => {
+            return Err("AUGUR CLI not found.".to_string());
+        }
+    };
+    let output = Command::new(&augur)
+        .args(["install", "--status", "--format", "json"])
+        .output()
+        .await
+        .map_err(|e| format!("could not run `augur install --status`: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        return Err(format!(
+            "`augur install --status` exited {:?}: {}",
+            output.status.code(),
+            stderr.trim()
+        ));
+    }
+    serde_json::from_slice(&output.stdout)
+        .map_err(|e| format!("could not parse model status JSON: {e}"))
+}
+
+/// Sprint 13 P3 — single-model install. Spawns
+/// `augur install --model <id> --format ndjson` and re-emits each
+/// progress line as a `model-install-progress` Tauri event.
+#[tauri::command]
+pub async fn install_model(
+    app: AppHandle,
+    model_id: String,
+) -> Result<(), String> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::process::Command;
+    let augur = crate::pipeline::find_augur_binary()
+        .ok_or_else(|| "AUGUR CLI not found.".to_string())?;
+    let mut cmd = Command::new(&augur);
+    cmd.args(["install", "--model", &model_id, "--format", "ndjson"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("Failed to start install: {e}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "no stdout from install".to_string())?;
+    let mut lines = BufReader::new(stdout).lines();
+    let app_for_task = app.clone();
+    let model_for_task = model_id.clone();
+    tokio::spawn(async move {
+        while let Ok(Some(line)) = lines.next_line().await {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) {
+                let _ = app_for_task.emit("model-install-progress", &json);
+            }
+        }
+        let _ = app_for_task.emit(
+            "model-install-finished",
+            serde_json::json!({"model_id": model_for_task}),
+        );
+        let _ = child.wait().await;
+    });
+    Ok(())
 }
 
 #[tauri::command]

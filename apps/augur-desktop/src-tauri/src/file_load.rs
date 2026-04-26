@@ -15,6 +15,12 @@ pub struct LoadedFile {
 }
 
 #[tauri::command]
+pub async fn open_directory_dialog(app: AppHandle) -> Result<Option<String>, String> {
+    let path = app.dialog().file().blocking_pick_folder();
+    Ok(path.map(|p| p.to_string()))
+}
+
+#[tauri::command]
 pub async fn open_evidence_dialog(app: AppHandle) -> Result<Option<String>, String> {
     let path = app
         .dialog()

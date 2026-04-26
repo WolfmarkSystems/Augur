@@ -3,6 +3,22 @@ import { useAppStore } from "../store/appStore";
 const MT_ADVISORY_SHORT =
   "Machine translation — verify with human linguist";
 
+function SelfTestSummary() {
+  const fails = useAppStore((s) => s.selfTestFails);
+  if (!fails || fails.length === 0) return null;
+  return (
+    <>
+      <span className="status-sep" aria-hidden="true">|</span>
+      <span
+        className="statusbar-selftest"
+        title={fails.join("\n")}
+      >
+        ● {fails.length} component{fails.length === 1 ? "" : "s"} unavailable
+      </span>
+    </>
+  );
+}
+
 export default function StatusBar() {
   const isTranslating = useAppStore((s) => s.isTranslating);
   const activeEngine = useAppStore((s) => s.activeEngine);
@@ -44,6 +60,7 @@ export default function StatusBar() {
           : "200 languages available"}
       </span>
       <span className="status-spacer" />
+      <SelfTestSummary />
       <span
         className="status-mt-advisory"
         title="The machine-translation advisory cannot be dismissed."

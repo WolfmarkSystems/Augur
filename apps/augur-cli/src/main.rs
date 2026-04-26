@@ -239,6 +239,20 @@ enum Command {
         /// unaffected. Default: off.
         #[arg(long, default_value_t = false)]
         diarize: bool,
+
+        /// Sprint 13 P1 — output format. `text` (default) is the
+        /// human-readable CLI output; `ndjson` emits one JSON
+        /// object per line on stdout (segment / dialect /
+        /// code_switch / complete / error events) so the desktop
+        /// GUI can stream-parse the pipeline. Anything else
+        /// falls back to text.
+        #[arg(long, default_value = "text")]
+        format: String,
+
+        /// Sprint 13 P1 — explicit source-language ISO 639-1
+        /// hint. When omitted the classifier auto-detects.
+        #[arg(long)]
+        source: Option<String>,
     },
 
     /// Show bundled AUGUR documentation. Without a topic
@@ -453,6 +467,14 @@ enum Command {
         #[arg(long, default_value_t = false)]
         all_foreign: bool,
 
+        /// Sprint 13 P2 — emit per-file progress events to stdout
+        /// in NDJSON form (`batch_file_start` / `batch_file_done`
+        /// / `batch_complete`) so the desktop GUI can drive a
+        /// live batch-progress view. The final report still lands
+        /// at `--output` in the chosen `--format`.
+        #[arg(long, default_value = "text")]
+        format_progress: String,
+
         /// Sprint 9 P2 — number of worker threads for parallel
         /// file processing. `0` (the default) means
         /// `min(num_cpus, 8)`. Use `1` to force the previous
@@ -493,6 +515,21 @@ enum Command {
         /// `standard`.
         #[arg(long)]
         profile_for_airgap: Option<String>,
+
+        /// Sprint 13 P3 — install one specific model by id (e.g.
+        /// `whisper-large-v3`, `nllb-1.3b`). Useful for adding
+        /// models post-initial install without re-running an
+        /// entire tier.
+        #[arg(long)]
+        model: Option<String>,
+
+        /// Sprint 13 P3 — output format. `text` (default) is the
+        /// human-readable rendering of `--list` / `--status` /
+        /// install logs; `json` makes `--status` emit a single
+        /// JSON document on stdout; `ndjson` makes `--model`
+        /// installs emit per-model progress events on stdout.
+        #[arg(long, default_value = "text")]
+        format: String,
     },
 }
 
@@ -665,12 +702,22 @@ fn run(
             output_srt,
             diarize,
             yara_rules,
+            format,
+            source,
         } => {
             let resolved = model.into_model(None);
             let effective_preset = match model {
                 CliWhisperModel::Auto => preset.into(),
                 _ => resolved.resolved_preset(),
             };
+            // Sprint 13 P1 — `--format ndjson` activates the
+            // streaming JSON output the desktop GUI consumes.
+            // Anything else (text / unknown) keeps the legacy
+            // human-readable rendering.
+            let ndjson = format.eq_ignore_ascii_case("ndjson");
+            // Source hint is informational at this layer; the
+            // pipeline runs the classifier regardless.
+            let _ = source;
             cmd_translate(
                 input.as_deref(),
                 text.as_deref(),
@@ -684,6 +731,7 @@ fn run(
                 diarize,
                 output_srt.as_deref(),
                 yara_rules.as_deref(),
+                ndjson,
             )
         }
         Command::Setup { hf_token } => cmd_setup(&hf_token),
@@ -730,21 +778,31 @@ fn run(
             config,
             format,
             all_foreign,
+            format_progress,
             threads,
-        } => cmd_batch(
-            &input,
-            &target,
-            types.as_deref(),
-            output.as_deref(),
-            &ocr_lang,
-            preset.into(),
-            backend,
-            translation_backend,
-            config.as_deref(),
-            format,
-            all_foreign,
-            threads,
-        ),
+        } => {
+            // Sprint 13 P2 — `--format-progress ndjson` enables
+            // the streaming progress channel for the desktop GUI.
+            // Activates the global NDJSON_MODE so all
+            // `[AUGUR] …` chatter is suppressed during the run.
+            if format_progress.eq_ignore_ascii_case("ndjson") {
+                NDJSON_MODE.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            cmd_batch(
+                &input,
+                &target,
+                types.as_deref(),
+                output.as_deref(),
+                &ocr_lang,
+                preset.into(),
+                backend,
+                translation_backend,
+                config.as_deref(),
+                format,
+                all_foreign,
+                threads,
+            )
+        }
         Command::Config { action } => cmd_config(action),
         Command::Install {
             profile,
@@ -752,17 +810,29 @@ fn run(
             status,
             airgap,
             profile_for_airgap,
+            model,
+            format,
         } => {
-            // When --airgap is set, profile_for_airgap (or the
-            // positional profile) names the tier to bundle. When
-            // --airgap is absent, the positional profile is the
-            // tier to install.
             let profile_arg = if airgap.is_some() {
                 profile_for_airgap.as_deref().or(profile.as_deref())
             } else {
                 profile.as_deref()
             };
-            install::cmd_install(profile_arg, list, status, airgap.as_deref())
+            // Sprint 13 P3 — JSON / NDJSON output modes activate
+            // NDJSON_MODE so the human-readable `[AUGUR] …` lines
+            // are suppressed and stdout carries machine output.
+            let format_l = format.to_lowercase();
+            if format_l == "json" || format_l == "ndjson" {
+                NDJSON_MODE.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            install::cmd_install(
+                profile_arg,
+                list,
+                status,
+                airgap.as_deref(),
+                model.as_deref(),
+                &format_l,
+            )
         }
     }
 }
@@ -913,7 +983,29 @@ fn cmd_translate(
     diarize: bool,
     output_srt: Option<&std::path::Path>,
     yara_rules: Option<&std::path::Path>,
+    ndjson: bool,
 ) -> Result<(), AugurError> {
+    // Sprint 13 P1 — NDJSON output mode. When enabled, all
+    // human-readable `[AUGUR] …` lines are suppressed and the
+    // command emits one JSON object per line on stdout instead.
+    // The desktop GUI consumes this stream to populate its
+    // split-view workspace event-by-event.
+    if ndjson {
+        return cmd_translate_ndjson(
+            input,
+            text,
+            image,
+            ocr_lang,
+            target,
+            preset,
+            backend,
+            translation_backend,
+            engine_kind,
+            diarize,
+            output_srt,
+            yara_rules,
+        );
+    }
     // Resolve the source text through the appropriate engine. The
     // pipelines diverge here:
     //   audio    → preprocess → STT → classifier → NLLB
@@ -1150,6 +1242,217 @@ fn cmd_translate(
     }
 
     Ok(())
+}
+
+/// Sprint 13 P1 — NDJSON streaming translate path. Emits one
+/// JSON object per line on stdout in the order the desktop GUI
+/// expects:
+///
+///   1. `dialect` (when source is Arabic and a dialect was
+///      identified)
+///   2. `segment` × N
+///   3. `complete`
+///
+/// Errors emit a single `error` line then return `Err`.
+/// `println!` here is the audited NDJSON output surface — the
+/// only stdout site in the binary outside `println_verify`.
+#[allow(clippy::too_many_arguments)]
+fn cmd_translate_ndjson(
+    input: Option<&std::path::Path>,
+    text: Option<&str>,
+    image: Option<&std::path::Path>,
+    ocr_lang: &str,
+    target: &str,
+    preset: WhisperPreset,
+    backend: ClassifierBackend,
+    translation_backend: TranslationBackend,
+    engine_kind: TranslationEngineKind,
+    _diarize: bool,
+    _output_srt: Option<&std::path::Path>,
+    _yara_rules: Option<&std::path::Path>,
+) -> Result<(), AugurError> {
+    NDJSON_MODE.store(true, std::sync::atomic::Ordering::Relaxed);
+    let started = std::time::Instant::now();
+    let resolved = match (input, text, image) {
+        (Some(path), None, None) => resolve_path_input(path, preset),
+        (None, Some(t), None) => {
+            let classifier = build_classifier(backend)?;
+            let cr = classifier.classify(t, target)?;
+            Ok(ResolvedSource {
+                text: t.to_string(),
+                upstream_lang: cr.language,
+                upstream_confidence: cr.confidence,
+                segments: None,
+                kind_label: "text",
+                audio_path: None,
+                audio_path_is_scratch: false,
+            })
+        }
+        (None, None, Some(img)) => resolve_image_input(img, ocr_lang),
+        (None, None, None) => Err(AugurError::InvalidInput(
+            "augur translate --format ndjson requires --input / --text / --image".to_string(),
+        )),
+        _ => Err(AugurError::InvalidInput(
+            "augur translate accepts only one of --input / --text / --image".to_string(),
+        )),
+    };
+    let resolved = match resolved {
+        Ok(r) => r,
+        Err(e) => {
+            emit_error_ndjson(&format!("{e}"));
+            return Err(e);
+        }
+    };
+
+    // Re-classify the resolved text for the canonical language /
+    // dialect signal, same as the human-readable path.
+    let classifier = match build_classifier(backend) {
+        Ok(c) => c,
+        Err(e) => {
+            emit_error_ndjson(&format!("{e}"));
+            return Err(e);
+        }
+    };
+    let classification = match classifier.classify(&resolved.text, target) {
+        Ok(c) => c,
+        Err(e) => {
+            emit_error_ndjson(&format!("{e}"));
+            return Err(e);
+        }
+    };
+
+    if let Some(dialect) = classification.arabic_dialect {
+        if !matches!(dialect, augur_classifier::ArabicDialect::Unknown) {
+            let source_label = if classification
+                .arabic_dialect_indicators
+                .iter()
+                .any(|s| s.starts_with("CAMeL:"))
+            {
+                "camel"
+            } else {
+                "lexical"
+            };
+            let json = serde_json::json!({
+                "type": "dialect",
+                "dialect": dialect.as_str(),
+                "confidence": classification.arabic_dialect_confidence,
+                "source": source_label,
+                "indicators": classification.arabic_dialect_indicators,
+            });
+            println!("{json}");
+        }
+    }
+
+    let lang = if classification.language.is_empty() {
+        resolved.upstream_lang.clone()
+    } else {
+        classification.language.clone()
+    };
+    if !lang.is_empty() && lang == target {
+        // Already in target language — emit a single completion
+        // event with zero segments.
+        let json = serde_json::json!({
+            "type": "complete",
+            "total_segments": 0,
+            "duration_ms": started.elapsed().as_millis() as u64,
+            "machine_translation_notice": MACHINE_TRANSLATION_NOTICE,
+        });
+        println!("{json}");
+        return Ok(());
+    }
+
+    let resolved_engine = match engine_kind {
+        TranslationEngineKind::Auto => augur_translate::select_engine(
+            &resolved.text,
+            &lang,
+            resolved.upstream_confidence,
+            augur_core::models::find_model("seamless-m4t-medium")
+                .map(augur_core::models::is_installed)
+                .unwrap_or(false),
+        ),
+        other => other,
+    };
+
+    let translation_result = match resolved_engine {
+        TranslationEngineKind::Seamless => {
+            let seamless = match SeamlessEngine::with_xdg_cache() {
+                Ok(s) => s,
+                Err(e) => {
+                    emit_error_ndjson(&format!("{e}"));
+                    return Err(e);
+                }
+            };
+            seamless.translate(&resolved.text, &lang, target)
+        }
+        _ => {
+            let mut engine = match TranslationEngine::with_xdg_cache() {
+                Ok(e) => e,
+                Err(e) => {
+                    emit_error_ndjson(&format!("{e}"));
+                    return Err(e);
+                }
+            };
+            engine.backend = translation_backend;
+            if let Some(segs) = &resolved.segments {
+                let trips: Vec<(u64, u64, String)> = segs
+                    .iter()
+                    .map(|s| (s.start_ms, s.end_ms, s.text.clone()))
+                    .collect();
+                engine.translate_segments(&trips, &lang, target)
+            } else {
+                engine.translate(&resolved.text, &lang, target)
+            }
+        }
+    };
+    let translation = match translation_result {
+        Ok(t) => t,
+        Err(e) => {
+            emit_error_ndjson(&format!("{e}"));
+            return Err(e);
+        }
+    };
+
+    let total_segments = if let Some(segments) = &translation.segments {
+        for (i, seg) in segments.iter().enumerate() {
+            let json = serde_json::json!({
+                "type": "segment",
+                "index": i,
+                "start_ms": seg.start_ms,
+                "end_ms": seg.end_ms,
+                "original": seg.source_text,
+                "translated": seg.translated_text,
+                "is_complete": true,
+            });
+            println!("{json}");
+        }
+        segments.len()
+    } else {
+        let json = serde_json::json!({
+            "type": "segment",
+            "index": 0,
+            "start_ms": null,
+            "end_ms": null,
+            "original": translation.source_text,
+            "translated": translation.translated_text,
+            "is_complete": true,
+        });
+        println!("{json}");
+        1
+    };
+
+    let json = serde_json::json!({
+        "type": "complete",
+        "total_segments": total_segments,
+        "duration_ms": started.elapsed().as_millis() as u64,
+        "machine_translation_notice": translation.advisory_notice,
+    });
+    println!("{json}");
+    Ok(())
+}
+
+fn emit_error_ndjson(message: &str) {
+    let json = serde_json::json!({"type": "error", "message": message});
+    println!("{json}");
 }
 
 fn run_yara_scans(
@@ -2069,10 +2372,26 @@ fn cmd_batch(
     let progress_path_ref = progress_path.as_deref();
     let target_ref = target;
 
+    // Sprint 13 P2 — emit a `batch_file_start` NDJSON event
+    // before each file when the global NDJSON_MODE is on.
+    let ndjson_progress = NDJSON_MODE.load(std::sync::atomic::Ordering::Relaxed);
+    let started_atomic = std::sync::atomic::AtomicU32::new(0);
+
     let mut results: Vec<BatchFileResult> = pool.install(|| {
         eligible
             .par_iter()
             .map(|(file, kind_label)| {
+                if ndjson_progress {
+                    let idx = started_atomic.fetch_add(1, Ordering::Relaxed) + 1;
+                    let json = serde_json::json!({
+                        "type": "batch_file_start",
+                        "file": file.to_string_lossy(),
+                        "input_type": kind_label,
+                        "index": idx,
+                        "total": total,
+                    });
+                    println!("{json}");
+                }
                 let row = match process_one_file(
                     file,
                     kind_label,
@@ -2133,6 +2452,20 @@ fn cmd_batch(
                         );
                     }
                 }
+                if ndjson_progress {
+                    let json = serde_json::json!({
+                        "type": "batch_file_done",
+                        "file": row.file_path,
+                        "input_type": kind_label,
+                        "detected_language": row.detected_language,
+                        "is_foreign": row.is_foreign,
+                        "translated": row.translated_text.is_some(),
+                        "error": row.error,
+                        "processed": processed_atomic.load(Ordering::Relaxed),
+                        "total": total,
+                    });
+                    println!("{json}");
+                }
                 row
             })
             .collect()
@@ -2181,6 +2514,20 @@ fn cmd_batch(
         if let Some(pp) = &progress_path {
             println_verify(format!("Progress snapshots: {pp:?}"));
         }
+    }
+
+    if ndjson_progress {
+        let json = serde_json::json!({
+            "type": "batch_complete",
+            "total_files": total,
+            "processed": processed,
+            "foreign_files": foreign_count,
+            "translated": translated_count,
+            "errors": errors,
+            "elapsed_seconds": elapsed,
+            "machine_translation_notice": MACHINE_TRANSLATION_NOTICE,
+        });
+        println!("{json}");
     }
 
     Ok(())
@@ -2599,7 +2946,22 @@ fn try_run_stt_with(
 /// surface (not a library emitting into a pipeline), and making
 /// it a single named function means every CLI line flows through
 /// one place a reviewer can audit.
+/// Sprint 13 P1 — when NDJSON mode is active, every
+/// `[AUGUR] …` line is suppressed so stdout carries the
+/// machine-readable stream alone. Set by `cmd_translate_ndjson`
+/// (and any future NDJSON-emitting subcommand) before any work
+/// runs.
+pub(crate) static NDJSON_MODE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 fn println_verify<S: AsRef<str>>(line: S) {
+    if NDJSON_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+        // Surface the message via `log::info!` so verbose dev
+        // runs (`RUST_LOG=info`) still see it; just keep stdout
+        // clean for the JSON consumer.
+        log::info!("{}", line.as_ref());
+        return;
+    }
     println!("[AUGUR] {}", line.as_ref());
 }
 

@@ -1,5 +1,7 @@
 import { create } from "zustand";
 import type {
+  BatchFileRow,
+  BatchProgress,
   CodeSwitchPoint,
   DialectInfo,
   FileKind,
@@ -58,6 +60,14 @@ export interface AppState {
   // Case info
   caseNumber: string;
 
+  // Sprint 13 P2 — batch mode
+  batch: BatchProgress | null;
+
+  // Sprint 13 P4 — startup health
+  augurAvailable: boolean | null;
+  augurBinaryPath: string | null;
+  selfTestFails: string[];
+
   // View toggles
   showDialectCard: boolean;
   showCodeSwitchBands: boolean;
@@ -79,6 +89,22 @@ export interface AppState {
   setProgress: (p: number) => void;
   setError: (msg: string | null) => void;
   setCaseNumber: (n: string) => void;
+
+  startBatch: (inputDir: string, outputPath: string, format: "html" | "json" | "csv" | "zip") => void;
+  onBatchFileStart: (path: string, inputType: string, total: number) => void;
+  onBatchFileDone: (row: Partial<BatchFileRow> & { path: string }) => void;
+  onBatchComplete: (counts: {
+    total: number;
+    processed: number;
+    foreign: number;
+    translated: number;
+    errors: number;
+  }) => void;
+  clearBatch: () => void;
+
+  setAugurAvailable: (v: boolean, path: string | null) => void;
+  setSelfTestFails: (fails: string[]) => void;
+
   toggleDialectCard: () => void;
   toggleCodeSwitchBands: () => void;
   setForceTranscriptView: (v: boolean) => void;
@@ -106,6 +132,11 @@ export const useAppStore = create<AppState>((set) => ({
   errorMessage: null,
 
   caseNumber: "CASE-2026-0001",
+
+  batch: null,
+  augurAvailable: null,
+  augurBinaryPath: null,
+  selfTestFails: [],
 
   showDialectCard: true,
   showCodeSwitchBands: true,
@@ -158,6 +189,89 @@ export const useAppStore = create<AppState>((set) => ({
   setProgress: (p) => set({ overallProgress: p }),
   setError: (msg) => set({ errorMessage: msg }),
   setCaseNumber: (n) => set({ caseNumber: n }),
+
+  startBatch: (inputDir, outputPath, format) =>
+    set({
+      batch: {
+        inputDir,
+        outputPath,
+        format,
+        total: 0,
+        processed: 0,
+        foreign: 0,
+        translated: 0,
+        errors: 0,
+        files: [],
+        isRunning: true,
+      },
+    }),
+  onBatchFileStart: (path, inputType, total) =>
+    set((s) => {
+      if (!s.batch) return {};
+      const name = path.split("/").pop() ?? path;
+      const existing = s.batch.files.find((f) => f.path === path);
+      const updated = existing
+        ? s.batch.files.map((f) =>
+            f.path === path ? { ...f, status: "active" as const } : f,
+          )
+        : [
+            ...s.batch.files,
+            {
+              path,
+              name,
+              inputType,
+              status: "active" as const,
+            },
+          ];
+      return {
+        batch: {
+          ...s.batch,
+          total: Math.max(s.batch.total, total),
+          files: updated,
+        },
+      };
+    }),
+  onBatchFileDone: (row) =>
+    set((s) => {
+      if (!s.batch) return {};
+      const path = row.path;
+      const next = s.batch.files.map((f) =>
+        f.path === path
+          ? {
+              ...f,
+              ...row,
+              status: row.error ? ("error" as const) : ("done" as const),
+            }
+          : f,
+      );
+      return {
+        batch: {
+          ...s.batch,
+          files: next,
+          processed: next.filter((f) => f.status === "done" || f.status === "error").length,
+          foreign: next.filter((f) => f.isForeign).length,
+          translated: next.filter((f) => f.translated).length,
+          errors: next.filter((f) => f.status === "error").length,
+        },
+      };
+    }),
+  onBatchComplete: (counts) =>
+    set((s) =>
+      s.batch
+        ? {
+            batch: {
+              ...s.batch,
+              ...counts,
+              isRunning: false,
+            },
+          }
+        : {},
+    ),
+  clearBatch: () => set({ batch: null }),
+
+  setAugurAvailable: (v, path) =>
+    set({ augurAvailable: v, augurBinaryPath: path }),
+  setSelfTestFails: (fails) => set({ selfTestFails: fails }),
 
   toggleDialectCard: () =>
     set((s) => ({ showDialectCard: !s.showDialectCard })),

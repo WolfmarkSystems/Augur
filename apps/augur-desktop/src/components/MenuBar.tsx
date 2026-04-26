@@ -2,9 +2,11 @@ import { useEffect, useRef, useState } from "react";
 import { useAppStore } from "../store/appStore";
 import {
   exportReport,
+  openDirectoryDialog,
   openEvidenceDialog,
   loadFileMetadata,
   saveReportDialog,
+  startBatchTranslation,
 } from "../ipc";
 import type { FileKind } from "../types";
 
@@ -50,6 +52,8 @@ export default function MenuBar({
   const dialect = useAppStore((s) => s.dialect);
   const caseNumber = useAppStore((s) => s.caseNumber);
   const setError = useAppStore((s) => s.setError);
+  const startBatch = useAppStore((s) => s.startBatch);
+  const targetLang = useAppStore((s) => s.targetLang);
 
   const handleOpen = async () => {
     setOpen(null);
@@ -60,6 +64,28 @@ export default function MenuBar({
       loadFile(meta.path, meta.name, meta.kind as FileKind, meta.size_bytes);
     } catch (err) {
       setError(`Could not open file: ${String(err)}`);
+    }
+  };
+
+  const handleOpenFolder = async () => {
+    setOpen(null);
+    try {
+      const dir = await openDirectoryDialog();
+      if (!dir) return;
+      const stamp = new Date()
+        .toISOString()
+        .replace(/[-:.TZ]/g, "")
+        .slice(0, 15);
+      const outPath = `${dir}/AUGUR_batch_${stamp}.json`;
+      startBatch(dir, outPath, "json");
+      await startBatchTranslation({
+        inputDir: dir,
+        targetLang: targetLang.code,
+        outputPath: outPath,
+        format: "json",
+      });
+    } catch (err) {
+      setError(`Could not start batch: ${String(err)}`);
     }
   };
 
@@ -127,6 +153,11 @@ export default function MenuBar({
                     label="Open Evidence…"
                     onClick={handleOpen}
                     shortcut="⌘O"
+                  />
+                  <Item
+                    label="Open Folder… (batch)"
+                    onClick={handleOpenFolder}
+                    shortcut="⌘⇧O"
                   />
                   <div className="menu-divider" />
                   <Item

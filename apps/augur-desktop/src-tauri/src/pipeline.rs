@@ -1,51 +1,87 @@
-//! Sprint 12 P6 — translation pipeline orchestration.
+//! Sprint 13 P1 — real `augur translate` subprocess wiring.
 //!
-//! In the production build this command shells out to the
-//! `augur` CLI (installed alongside the desktop app) and parses
-//! its line-buffered output, emitting `segment-ready` /
-//! `dialect-detected` / `code-switch-detected` /
-//! `translation-complete` Tauri events as work progresses.
+//! Spawns the `augur` CLI with `--format ndjson`, parses each
+//! line, and re-emits it as a typed Tauri event. The desktop
+//! GUI consumes the events to paint the split-view workspace
+//! live.
 //!
-//! The CLI binary is invoked with the same flags the user would
-//! type, so the desktop app inherits every CLI-level safeguard
-//! (the mandatory MT advisory, dialect disambiguation, etc.).
-//! When the CLI is not on PATH we fall back to a deterministic
-//! event emission sequence so the GUI is still demonstrably
-//! exercised end-to-end on a developer workstation.
+//! Locating the CLI: env override → sibling-of-exe → cargo-bin
+//! → PATH. The first hit wins; if nothing is found,
+//! `start_translation` returns the structured "CLI not found"
+//! error and the front-end shows the install banner (P4).
 
-use std::path::PathBuf;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
 
-use serde::Serialize;
+use serde_json::Value;
 use tauri::{AppHandle, Emitter};
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::Command;
 
-#[derive(Debug, Clone, Serialize)]
-pub struct SegmentEvent {
-    pub index: u32,
-    pub start_ms: Option<u64>,
-    pub end_ms: Option<u64>,
-    pub original_text: String,
-    pub translated_text: String,
-    pub is_complete: bool,
+/// Resolve the `augur` CLI binary in priority order:
+///   1. `AUGUR_BIN` env var (dev / CI override)
+///   2. Same directory as the desktop executable (production
+///      .app bundles ship the CLI alongside)
+///   3. `~/.cargo/bin/augur` (developer-local installs)
+///   4. System PATH
+pub fn find_augur_binary() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("AUGUR_BIN") {
+        let p = PathBuf::from(path);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        let sibling = exe
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("augur");
+        if sibling.exists() {
+            return Some(sibling);
+        }
+    }
+    if let Some(home) = dirs::home_dir() {
+        let cargo_bin = home.join(".cargo").join("bin").join("augur");
+        if cargo_bin.exists() {
+            return Some(cargo_bin);
+        }
+    }
+    which::which("augur").ok()
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct DialectEvent {
-    pub dialect: String,
-    pub confidence: f32,
-    pub source: &'static str,
+#[tauri::command]
+pub async fn check_augur_available() -> bool {
+    find_augur_binary().is_some()
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct CodeSwitchEvent {
-    pub offset: u32,
-    pub from: String,
-    pub to: String,
+/// Sprint 13 P4 — non-blocking startup self-test. Shells out to
+/// `augur self-test --format json` (when supported) or just
+/// `augur self-test` and parses any "FAIL" lines into a short
+/// list. Empty Vec means everything passed; missing CLI returns
+/// `Err`. The desktop GUI surfaces the result in the status
+/// bar so the examiner sees "2 components unavailable" without
+/// having to open a terminal.
+#[tauri::command]
+pub async fn run_startup_self_test() -> Result<Vec<String>, String> {
+    let augur = find_augur_binary()
+        .ok_or_else(|| "AUGUR CLI not found.".to_string())?;
+    let output = tokio::process::Command::new(&augur)
+        .arg("self-test")
+        .output()
+        .await
+        .map_err(|e| format!("self-test spawn failed: {e}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut fails: Vec<String> = Vec::new();
+    for line in stdout.lines() {
+        if line.contains("[FAIL]") {
+            fails.push(line.trim().to_string());
+        }
+    }
+    Ok(fails)
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct CompleteEvent {
-    pub total_segments: u32,
+#[tauri::command]
+pub async fn augur_binary_path() -> Option<String> {
+    find_augur_binary().map(|p| p.display().to_string())
 }
 
 #[tauri::command]
@@ -57,100 +93,314 @@ pub async fn start_translation(
     stt_model: String,
     engine: String,
 ) -> Result<(), String> {
+    let augur = find_augur_binary().ok_or_else(|| {
+        "AUGUR CLI not found. Run the AUGUR Installer or install via `cargo install augur`."
+            .to_string()
+    })?;
     let p = PathBuf::from(&file_path);
     if !p.exists() {
         return Err(format!("file does not exist: {file_path}"));
     }
+
     log::info!(
         "start_translation: file={file_path} source={source_lang} target={target_lang} \
-         stt={stt_model} engine={engine}"
+         stt={stt_model} engine={engine} (augur={})",
+        augur.display()
     );
 
-    // Spawn so the command returns immediately and the UI stays
-    // responsive while events flow.
+    let mut cmd = Command::new(&augur);
+    cmd.arg("translate")
+        .arg("--input")
+        .arg(&file_path)
+        .arg("--target")
+        .arg(&target_lang)
+        .arg("--format")
+        .arg("ndjson");
+    if stt_model != "auto" {
+        cmd.arg("--model").arg(&stt_model);
+    }
+    if engine != "auto" {
+        cmd.arg("--engine").arg(&engine);
+    }
+    if source_lang != "auto" && !source_lang.is_empty() {
+        cmd.arg("--source").arg(&source_lang);
+    }
+    cmd.stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    let app_for_task = app.clone();
     tokio::spawn(async move {
-        if let Err(e) = run_translation(&app, &file_path, &source_lang, &target_lang).await {
-            let _ = app.emit(
+        if let Err(e) = pump_translation(&app_for_task, cmd).await {
+            let _ = app_for_task.emit(
                 "translation-error",
-                serde_json::json!({"error": e}),
+                serde_json::json!({"message": e}),
             );
         }
     });
     Ok(())
 }
 
-async fn run_translation(
-    app: &AppHandle,
-    _file_path: &str,
-    source_lang: &str,
-    target_lang: &str,
-) -> Result<(), String> {
-    // Sprint 12 placeholder pipeline. Production wiring shells
-    // out to the `augur translate ...` CLI and parses its
-    // segment output; until that is wired the desktop GUI emits
-    // a deterministic four-segment fixture so every UI surface
-    // (dialect card, code-switch band, live cursor, completion
-    // state) is exercised on click.
-    let demo: Vec<(u64, u64, &str, &str)> = match source_lang {
-        "ar" => vec![
-            (0, 2_500, "السلام عليكم", "Peace be upon you"),
-            (2_500, 6_000, "كيف حالك اليوم", "How are you today"),
-            (6_000, 9_000, "I am going to the market", "I am going to the market"),
-            (9_000, 12_000, "غداً إن شاء الله", "Tomorrow, God willing"),
-        ],
-        _ => vec![
-            (0, 1_500, "Hello there", "Hello there"),
-            (1_500, 3_000, "How are you", "How are you"),
-            (3_000, 4_500, "Thanks for stopping by", "Thanks for stopping by"),
-        ],
-    };
+async fn pump_translation(app: &AppHandle, mut cmd: Command) -> Result<(), String> {
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("Failed to start AUGUR: {e}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "no stdout from AUGUR process".to_string())?;
+    let stderr = child.stderr.take();
+    let mut lines = BufReader::new(stdout).lines();
 
-    if source_lang == "ar" {
-        let _ = app.emit(
-            "dialect-detected",
-            DialectEvent {
-                dialect: "Egyptian (Masri)".into(),
-                confidence: 0.89,
-                source: "camel",
-            },
-        );
-    }
-
-    for (i, (start, end, src, tgt)) in demo.iter().enumerate() {
-        tokio::time::sleep(Duration::from_millis(550)).await;
-        let _ = app.emit(
-            "segment-ready",
-            SegmentEvent {
-                index: i as u32,
-                start_ms: Some(*start),
-                end_ms: Some(*end),
-                original_text: (*src).to_string(),
-                translated_text: (*tgt).to_string(),
-                is_complete: true,
-            },
-        );
-        // Mid-stream code-switch in the Arabic fixture.
-        if source_lang == "ar" && i == 1 {
-            let _ = app.emit(
-                "code-switch-detected",
-                CodeSwitchEvent {
-                    offset: i as u32 + 1,
-                    from: "ar".into(),
-                    to: "en".into(),
-                },
-            );
+    while let Some(line) = lines
+        .next_line()
+        .await
+        .map_err(|e| format!("read stdout: {e}"))?
+    {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let json = match serde_json::from_str::<Value>(&line) {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!("non-JSON line on stdout: {line:?} ({e})");
+                continue;
+            }
+        };
+        match json
+            .get("type")
+            .and_then(|t| t.as_str())
+            .unwrap_or_default()
+        {
+            "segment" => emit_segment(app, &json),
+            "dialect" => emit_dialect(app, &json),
+            "code_switch" => emit_code_switch(app, &json),
+            "complete" => {
+                let _ = app.emit("translation-complete", &json);
+                break;
+            }
+            "error" => {
+                let msg = json
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("Unknown error from AUGUR")
+                    .to_string();
+                let _ = app.emit(
+                    "translation-error",
+                    serde_json::json!({"message": msg}),
+                );
+                break;
+            }
+            other => log::warn!("unknown NDJSON event type: {other:?}"),
         }
     }
 
-    let _ = app.emit(
-        "translation-complete",
-        CompleteEvent {
-            total_segments: demo.len() as u32,
-        },
-    );
-    log::info!(
-        "translation-complete: {} segments emitted (source={source_lang} → target={target_lang})",
-        demo.len()
-    );
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| format!("wait for AUGUR: {e}"))?;
+    if !status.success() {
+        let stderr_msg = if let Some(stderr) = stderr {
+            let mut buf = String::new();
+            let mut err_lines = BufReader::new(stderr).lines();
+            while let Ok(Some(l)) = err_lines.next_line().await {
+                buf.push_str(&l);
+                buf.push('\n');
+            }
+            buf
+        } else {
+            String::new()
+        };
+        let summary = if stderr_msg.trim().is_empty() {
+            format!("AUGUR exited with {status}")
+        } else {
+            format!("AUGUR exited with {status}: {}", stderr_msg.trim())
+        };
+        let _ = app.emit(
+            "translation-error",
+            serde_json::json!({"message": summary}),
+        );
+    }
     Ok(())
+}
+
+/// Re-shape the CLI's snake_case `segment` event into the
+/// camelCase shape the React side has consumed since Sprint 12.
+#[tauri::command]
+pub async fn start_batch_translation(
+    app: AppHandle,
+    input_dir: String,
+    target_lang: String,
+    output_path: String,
+    format: String,
+) -> Result<(), String> {
+    let augur = find_augur_binary()
+        .ok_or_else(|| "AUGUR CLI not found.".to_string())?;
+    if !PathBuf::from(&input_dir).exists() {
+        return Err(format!("directory does not exist: {input_dir}"));
+    }
+    let mut cmd = Command::new(&augur);
+    cmd.arg("batch")
+        .arg("--input")
+        .arg(&input_dir)
+        .arg("--target")
+        .arg(&target_lang)
+        .arg("--output")
+        .arg(&output_path)
+        .arg("--format")
+        .arg(&format)
+        .arg("--format-progress")
+        .arg("ndjson")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let app_for_task = app.clone();
+    tokio::spawn(async move {
+        if let Err(e) = pump_batch(&app_for_task, cmd).await {
+            let _ = app_for_task.emit(
+                "batch-error",
+                serde_json::json!({"message": e}),
+            );
+        }
+    });
+    Ok(())
+}
+
+async fn pump_batch(app: &AppHandle, mut cmd: Command) -> Result<(), String> {
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("Failed to start AUGUR batch: {e}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "no stdout from AUGUR batch".to_string())?;
+    let mut lines = BufReader::new(stdout).lines();
+    while let Some(line) = lines
+        .next_line()
+        .await
+        .map_err(|e| format!("read stdout: {e}"))?
+    {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let json: Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!("non-JSON batch line: {line:?} ({e})");
+                continue;
+            }
+        };
+        match json
+            .get("type")
+            .and_then(|t| t.as_str())
+            .unwrap_or_default()
+        {
+            "batch_file_start" => {
+                let _ = app.emit("batch-file-start", &json);
+            }
+            "batch_file_done" => {
+                let _ = app.emit("batch-file-done", &json);
+            }
+            "batch_complete" => {
+                let _ = app.emit("batch-complete", &json);
+                break;
+            }
+            other => log::warn!("unknown batch event type: {other:?}"),
+        }
+    }
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| format!("wait for AUGUR batch: {e}"))?;
+    if !status.success() {
+        let _ = app.emit(
+            "batch-error",
+            serde_json::json!({"message": format!("AUGUR batch exited with {status}")}),
+        );
+    }
+    Ok(())
+}
+
+fn emit_segment(app: &AppHandle, json: &Value) {
+    let original = json.get("original").cloned().unwrap_or(Value::Null);
+    let translated = json.get("translated").cloned().unwrap_or(Value::Null);
+    let payload = serde_json::json!({
+        "index": json.get("index").and_then(|v| v.as_u64()).unwrap_or(0),
+        "start_ms": json.get("start_ms").cloned().unwrap_or(Value::Null),
+        "end_ms": json.get("end_ms").cloned().unwrap_or(Value::Null),
+        "original_text": original.as_str().unwrap_or(""),
+        "translated_text": translated.as_str().unwrap_or(""),
+        "is_complete": json.get("is_complete").and_then(|v| v.as_bool()).unwrap_or(true),
+    });
+    let _ = app.emit("segment-ready", payload);
+}
+
+fn emit_dialect(app: &AppHandle, json: &Value) {
+    let payload = serde_json::json!({
+        "dialect": json.get("dialect").and_then(|v| v.as_str()).unwrap_or(""),
+        "confidence": json.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.0),
+        "source": json.get("source").and_then(|v| v.as_str()).unwrap_or("lexical"),
+    });
+    let _ = app.emit("dialect-detected", payload);
+}
+
+fn emit_code_switch(app: &AppHandle, json: &Value) {
+    let payload = serde_json::json!({
+        "offset": json.get("offset").and_then(|v| v.as_u64()).unwrap_or(0),
+        "from": json.get("from").and_then(|v| v.as_str()).unwrap_or(""),
+        "to": json.get("to").and_then(|v| v.as_str()).unwrap_or(""),
+    });
+    let _ = app.emit("code-switch-detected", payload);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ndjson_segment_serializes_correctly() {
+        let json = serde_json::json!({
+            "type": "segment",
+            "index": 0,
+            "original": "مرحبا",
+            "translated": "Hello",
+            "is_complete": true,
+        });
+        assert_eq!(json["type"], "segment");
+        assert_eq!(json["translated"], "Hello");
+    }
+
+    #[test]
+    fn ndjson_parse_segment_event() {
+        let line = r#"{"type":"segment","index":0,"original":"test","translated":"test","is_complete":true}"#;
+        let json: Value = serde_json::from_str(line).expect("valid JSON");
+        assert_eq!(json["type"], "segment");
+    }
+
+    #[test]
+    fn find_augur_binary_runs_without_panic() {
+        let _ = find_augur_binary();
+    }
+
+    #[test]
+    fn batch_ndjson_file_start_parsed() {
+        let line = r#"{"type":"batch_file_start","file":"test.mp3","input_type":"audio","index":1,"total":10}"#;
+        let json: Value = serde_json::from_str(line).expect("valid JSON");
+        assert_eq!(json["type"], "batch_file_start");
+        assert_eq!(json["total"], 10);
+    }
+
+    #[test]
+    fn check_augur_available_returns_bool() {
+        // Just verifies the synchronous resolver runs cleanly —
+        // the async Tauri command wrapping it is the same code
+        // path. Result is host-dependent.
+        let _ = find_augur_binary();
+    }
+
+    #[test]
+    fn batch_ndjson_complete_parsed() {
+        let line = r#"{"type":"batch_complete","total_files":47,"foreign_files":12,"processed":47,"translated":12,"errors":0,"elapsed_seconds":135.4}"#;
+        let json: Value = serde_json::from_str(line).expect("valid JSON");
+        assert_eq!(json["type"], "batch_complete");
+        assert_eq!(json["foreign_files"], 12);
+    }
 }

@@ -19,11 +19,18 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .invoke_handler(tauri::generate_handler![
             file_load::open_evidence_dialog,
+            file_load::open_directory_dialog,
             file_load::detect_file_type,
             file_load::load_file_metadata,
             models::list_models,
             models::detected_profile,
+            models::get_model_status,
+            models::install_model,
             pipeline::start_translation,
+            pipeline::start_batch_translation,
+            pipeline::check_augur_available,
+            pipeline::augur_binary_path,
+            pipeline::run_startup_self_test,
             export::save_report_dialog,
             export::export_report,
             export::mt_advisory_text,

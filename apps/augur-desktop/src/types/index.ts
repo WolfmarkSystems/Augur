@@ -44,3 +44,29 @@ export interface ModelStatus {
   installed: boolean;
   tier: string;
 }
+
+export type BatchFileStatus = "waiting" | "active" | "done" | "error";
+
+export interface BatchFileRow {
+  path: string;
+  name: string;
+  inputType?: string;
+  detectedLanguage?: string;
+  isForeign?: boolean;
+  translated?: boolean;
+  error?: string | null;
+  status: BatchFileStatus;
+}
+
+export interface BatchProgress {
+  inputDir: string | null;
+  outputPath: string | null;
+  format: "html" | "json" | "csv" | "zip";
+  total: number;
+  processed: number;
+  foreign: number;
+  translated: number;
+  errors: number;
+  files: BatchFileRow[];
+  isRunning: boolean;
+}

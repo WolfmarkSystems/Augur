@@ -29,18 +29,33 @@ pub fn cmd_install(
     list: bool,
     status: bool,
     airgap_output: Option<&Path>,
+    single_model: Option<&str>,
+    format: &str,
 ) -> Result<(), AugurError> {
+    let json_mode = format == "json";
+    let ndjson_mode = format == "ndjson";
+    if let Some(model_id) = single_model {
+        return install_single_model(model_id, ndjson_mode);
+    }
     if list {
-        print_catalog();
+        if json_mode {
+            print_catalog_json();
+        } else {
+            print_catalog();
+        }
         return Ok(());
     }
     if status {
-        print_status();
+        if json_mode {
+            print_status_json();
+        } else {
+            print_status();
+        }
         return Ok(());
     }
     let profile = profile.ok_or_else(|| {
         AugurError::InvalidInput(
-            "augur install: a profile (minimal/standard/full), --list, --status, or --airgap is required"
+            "augur install: a profile (minimal/standard/full), --list, --status, --airgap, or --model is required"
                 .into(),
         )
     })?;
@@ -49,6 +64,163 @@ pub fn cmd_install(
         return build_airgap(tier, out);
     }
     install_tier(tier)
+}
+
+/// Sprint 13 P3 — JSON snapshot of the catalog. Single document
+/// emitted to stdout via `println!`. The crate's `println_augur`
+/// helper already routes nothing to stdout when NDJSON_MODE is
+/// active, so this is the sole stdout site for the JSON path.
+fn print_catalog_json() {
+    let models: Vec<_> = ALL_MODELS
+        .iter()
+        .map(|m| {
+            serde_json::json!({
+                "id": m.id,
+                "name": m.name,
+                "tier": tier_label(m.tier),
+                "type": type_label(m.model_type),
+                "size_bytes": m.size_bytes,
+                "size_display": format!("{:.1} MB", m.size_bytes as f64 / 1e6),
+                "description": m.description,
+                "quality_note": m.quality_note,
+                "download_url": m.download_url,
+                "is_bundled": false,
+            })
+        })
+        .collect();
+    let body = serde_json::json!({
+        "models": models,
+        "tiers": {
+            "minimal":  total_size_for_tier(&ModelTier::Minimal),
+            "standard": total_size_for_tier(&ModelTier::Standard),
+            "full":     total_size_for_tier(&ModelTier::Full),
+        },
+    });
+    println!("{}", serde_json::to_string_pretty(&body).unwrap_or_default());
+}
+
+fn print_status_json() {
+    let mut installed_bytes: u64 = 0;
+    let mut total_bytes: u64 = 0;
+    let models: Vec<_> = ALL_MODELS
+        .iter()
+        .map(|m| {
+            let inst = is_installed(m);
+            total_bytes += m.size_bytes;
+            if inst {
+                installed_bytes += m.size_bytes;
+            }
+            serde_json::json!({
+                "id": m.id,
+                "name": m.name,
+                "tier": tier_label(m.tier),
+                "installed": inst,
+                "size_bytes": m.size_bytes,
+                "size_display": format!("{:.1} MB", m.size_bytes as f64 / 1e6),
+            })
+        })
+        .collect();
+    let profile = detected_profile();
+    let body = serde_json::json!({
+        "profile": profile,
+        "models": models,
+        "total_installed_bytes": installed_bytes,
+        "total_bytes": total_bytes,
+        "profile_complete": profile == "full",
+    });
+    println!("{}", serde_json::to_string_pretty(&body).unwrap_or_default());
+}
+
+fn detected_profile() -> &'static str {
+    let installed_in = |t: ModelTier| {
+        ALL_MODELS
+            .iter()
+            .filter(|m| m.tier == t)
+            .all(is_installed)
+    };
+    if installed_in(ModelTier::Minimal)
+        && installed_in(ModelTier::Standard)
+        && installed_in(ModelTier::Full)
+    {
+        "full"
+    } else if installed_in(ModelTier::Minimal) && installed_in(ModelTier::Standard) {
+        "standard"
+    } else if installed_in(ModelTier::Minimal) {
+        "minimal"
+    } else {
+        "none"
+    }
+}
+
+/// Sprint 13 P3 — single-model install. NDJSON mode emits
+/// `model_install_start` / `model_install_complete` events.
+fn install_single_model(model_id: &str, ndjson: bool) -> Result<(), AugurError> {
+    let spec = augur_core::models::find_model(model_id).ok_or_else(|| {
+        AugurError::InvalidInput(format!("unknown model id: {model_id}"))
+    })?;
+    if ndjson {
+        let json = serde_json::json!({
+            "type": "model_install_start",
+            "model_id": spec.id,
+            "name": spec.name,
+            "size_bytes": spec.size_bytes,
+        });
+        println!("{json}");
+    } else {
+        println_augur(format!(
+            "Installing single model: {} ({:.1} MB)",
+            spec.name,
+            spec.size_bytes as f64 / 1e6
+        ));
+    }
+    let result = install_model(spec);
+    match &result {
+        Ok(()) => {
+            if let Err(e) = verify_model_integrity(spec) {
+                if ndjson {
+                    let json = serde_json::json!({
+                        "type": "model_install_error",
+                        "model_id": spec.id,
+                        "error": format!("integrity: {e}"),
+                    });
+                    println!("{json}");
+                } else {
+                    println_augur(format!("    ✗ integrity FAIL — {e}"));
+                }
+                return Err(AugurError::IntegrityFailure {
+                    model: spec.id.into(),
+                    expected: spec.sha256.into(),
+                    computed: String::new(),
+                });
+            }
+            if ndjson {
+                let json = serde_json::json!({
+                    "type": "model_install_complete",
+                    "model_id": spec.id,
+                });
+                println!("{json}");
+            } else {
+                println_augur("    ✓ done");
+            }
+            Ok(())
+        }
+        Err(e) => {
+            if ndjson {
+                let json = serde_json::json!({
+                    "type": "model_install_error",
+                    "model_id": spec.id,
+                    "error": e.to_string(),
+                });
+                println!("{json}");
+            } else {
+                println_augur(format!("    ✗ FAIL — {e}"));
+            }
+            Err(AugurError::DownloadFailed {
+                model: spec.id.into(),
+                reason: e.to_string(),
+            })
+        }
+    }
 }
 
 fn parse_tier(profile: &str) -> Result<ModelTier, AugurError> {

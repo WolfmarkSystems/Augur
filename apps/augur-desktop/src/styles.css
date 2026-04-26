@@ -950,3 +950,327 @@ button:disabled {
   color: var(--c-text-3);
   margin-top: 14px;
 }
+
+/* ── Batch workspace (Sprint 13 P2) ──────────────────────── */
+
+.batch-workspace {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  padding: 18px 22px;
+  gap: 12px;
+}
+
+.batch-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  background: var(--c-bg-elev);
+  border: 0.5px solid var(--c-border-1);
+  border-radius: 8px;
+  padding: 12px 16px;
+}
+
+.batch-title {
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-size: 11px;
+  color: var(--c-text-2);
+}
+
+.batch-sub {
+  font-size: 12px;
+  color: var(--c-text-3);
+  margin-top: 2px;
+  word-break: break-all;
+}
+
+.batch-counts {
+  display: flex;
+  gap: 14px;
+  font-size: 12px;
+  color: var(--c-text-2);
+}
+
+.batch-counts-err {
+  color: var(--c-error);
+  font-weight: 600;
+}
+
+.batch-list {
+  flex: 1;
+  overflow-y: auto;
+  background: var(--c-bg-elev);
+  border: 0.5px solid var(--c-border-1);
+  border-radius: 8px;
+  padding: 8px;
+}
+
+.batch-row {
+  display: grid;
+  grid-template-columns: 70px 1fr auto auto;
+  gap: 10px;
+  align-items: center;
+  padding: 8px 12px;
+  font-size: 13px;
+  border-radius: 6px;
+}
+
+.batch-row.is-waiting { opacity: 0.5; }
+.batch-row.is-active  { background: var(--c-accent-soft); }
+.batch-row.is-done    { background: rgba(29, 158, 117, 0.06); }
+.batch-row.is-error   { background: rgba(179, 38, 30, 0.07); }
+
+.batch-row-idx {
+  color: var(--c-text-3);
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+}
+
+.batch-row-name {
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.batch-row-meta {
+  display: inline-flex;
+  gap: 6px;
+  color: var(--c-text-3);
+  font-size: 11px;
+}
+
+.batch-row-lang,
+.batch-row-kind {
+  background: var(--c-bg-3);
+  padding: 1px 6px;
+  border-radius: 999px;
+}
+
+.batch-row-status .check {
+  color: var(--c-accent-fill);
+  font-weight: 600;
+  font-size: 12px;
+}
+
+.batch-row-err {
+  color: var(--c-error);
+  font-weight: 600;
+  font-size: 12px;
+}
+
+.spinner {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 2px solid var(--c-border-1);
+  border-top-color: var(--c-accent);
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+.waiting-pill {
+  font-size: 11px;
+  color: var(--c-text-3);
+  padding: 2px 8px;
+  background: var(--c-bg-3);
+  border-radius: 999px;
+}
+
+.batch-footer {
+  background: var(--c-bg-elev);
+  border: 0.5px solid var(--c-border-1);
+  border-radius: 8px;
+  padding: 10px 14px;
+}
+
+.overall-progress {
+  height: 5px;
+  background: var(--c-bg-3);
+  border-radius: 3px;
+  overflow: hidden;
+  margin-bottom: 6px;
+}
+
+.overall-progress-fill {
+  height: 100%;
+  background: var(--c-accent-fill);
+  transition: width 0.25s ease;
+}
+
+.batch-footer-row {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  color: var(--c-text-2);
+}
+
+/* ── CLI not-found banner (Sprint 13 P4) ────────────────── */
+
+.cli-banner {
+  position: absolute;
+  bottom: 36px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--c-amber-soft);
+  color: var(--c-amber);
+  border: 1px solid var(--c-amber);
+  padding: 8px 14px;
+  border-radius: 999px;
+  font-size: 12px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.18);
+  z-index: 500;
+  pointer-events: none;
+}
+
+.cli-banner code {
+  background: rgba(255, 255, 255, 0.6);
+  padding: 1px 6px;
+  border-radius: 4px;
+}
+
+/* ── Error banner (Sprint 13 P4) ────────────────────────── */
+
+.error-banner {
+  display: grid;
+  grid-template-columns: 28px 1fr auto;
+  gap: 14px;
+  align-items: start;
+  padding: 12px 16px;
+  background: var(--c-amber-soft);
+  border-bottom: 1px solid var(--c-amber);
+  color: var(--c-text-1);
+  font-size: 13px;
+}
+
+.error-banner.is-cli-not-found,
+.error-banner.is-translation-failed {
+  background: rgba(179, 38, 30, 0.07);
+  border-bottom-color: var(--c-error);
+}
+
+.error-banner-icon {
+  font-size: 20px;
+  color: var(--c-amber);
+  text-align: center;
+}
+
+.error-banner.is-cli-not-found .error-banner-icon,
+.error-banner.is-translation-failed .error-banner-icon {
+  color: var(--c-error);
+}
+
+.error-banner-title {
+  font-weight: 600;
+  margin-bottom: 2px;
+}
+
+.error-banner-text {
+  color: var(--c-text-2);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.error-banner-detail {
+  margin-top: 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  background: var(--c-bg-elev);
+  padding: 6px 8px;
+  border-radius: 4px;
+  border: 0.5px solid var(--c-border-1);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.error-banner-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.error-banner-close {
+  background: transparent;
+  border: 0;
+  color: var(--c-text-2);
+  font-size: 18px;
+  line-height: 1;
+  padding: 4px 8px;
+  border-radius: 4px;
+}
+
+.error-banner-close:hover {
+  background: var(--c-bg-3);
+}
+
+.btn {
+  background: var(--c-bg-3);
+  color: var(--c-text-1);
+  border: 0;
+  padding: 6px 12px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.btn-primary {
+  background: var(--c-accent);
+  color: #fff;
+}
+
+.btn-primary:hover { opacity: 0.9; }
+
+.statusbar-selftest {
+  color: var(--c-amber);
+  font-weight: 500;
+}
+
+.overlay-panel-wide { width: min(720px, 92vw); }
+
+.btn-mm-download {
+  background: var(--c-accent);
+  color: #fff;
+  border: 0;
+  padding: 4px 12px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.btn-mm-download:hover { opacity: 0.9; }
+
+.mm-row-status-cell {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 110px;
+  justify-content: flex-end;
+}
+
+.mm-error {
+  background: rgba(179, 38, 30, 0.06);
+  border: 1px solid var(--c-error);
+  border-radius: 6px;
+  padding: 10px 14px;
+  color: var(--c-error);
+  font-size: 13px;
+}
+
+.mm-error code {
+  background: rgba(255, 255, 255, 0.6);
+  padding: 0 4px;
+  border-radius: 3px;
+  color: var(--c-text-1);
+}
+
+.mm-row-err {
+  grid-column: 1 / -1;
+  font-size: 11px;
+  color: var(--c-error);
+  margin-top: 2px;
+}
