@@ -133,3 +133,21 @@ augur batch \
   certified linguist.
 - **Identify speakers.** Diarization assigns anonymous
   `SPEAKER_NN` labels. These are NOT biometric identification.
+
+## Migrating from VERIFY to AUGUR
+
+If you previously used VERIFY and have cached models:
+
+```bash
+# Move existing model cache
+mv ~/.cache/verify ~/.cache/augur
+
+# Update environment variables
+# Old: VERIFY_AIRGAP_PATH, VERIFY_GEOIP_PATH, VERIFY_HF_CACHE
+# New: AUGUR_AIRGAP_PATH,  AUGUR_GEOIP_PATH,  AUGUR_HF_CACHE
+
+# Config file
+mv ~/.verify_report.toml ~/.augur_report.toml
+```
+
+Models do not need to be re-downloaded. Only the cache path changes.
