@@ -1,0 +1,222 @@
+import { useEffect, useRef, useState } from "react";
+import { useAppStore } from "../store/appStore";
+import {
+  exportReport,
+  openEvidenceDialog,
+  loadFileMetadata,
+  saveReportDialog,
+} from "../ipc";
+import type { FileKind } from "../types";
+
+interface Props {
+  onOpenModelManager: () => void;
+  onOpenAdvisory: () => void;
+  onSetCaseNumber: () => void;
+}
+
+export default function MenuBar({
+  onOpenModelManager,
+  onOpenAdvisory,
+  onSetCaseNumber,
+}: Props) {
+  const [open, setOpen] = useState<string | null>(null);
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setOpen(null);
+    };
+    const onClick = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) {
+        setOpen(null);
+      }
+    };
+    document.addEventListener("keydown", onKey);
+    document.addEventListener("mousedown", onClick);
+    return () => {
+      document.removeEventListener("keydown", onKey);
+      document.removeEventListener("mousedown", onClick);
+    };
+  }, [open]);
+
+  const loadFile = useAppStore((s) => s.loadFile);
+  const setForceTranscript = useAppStore((s) => s.setForceTranscriptView);
+  const toggleDialect = useAppStore((s) => s.toggleDialectCard);
+  const toggleBands = useAppStore((s) => s.toggleCodeSwitchBands);
+  const segments = useAppStore((s) => s.segments);
+  const sourceLang = useAppStore((s) => s.sourceLang);
+  const targetLang = useAppStore((s) => s.targetLang);
+  const dialect = useAppStore((s) => s.dialect);
+  const caseNumber = useAppStore((s) => s.caseNumber);
+  const setError = useAppStore((s) => s.setError);
+
+  const handleOpen = async () => {
+    setOpen(null);
+    try {
+      const path = await openEvidenceDialog();
+      if (!path) return;
+      const meta = await loadFileMetadata(path);
+      loadFile(meta.path, meta.name, meta.kind as FileKind, meta.size_bytes);
+    } catch (err) {
+      setError(`Could not open file: ${String(err)}`);
+    }
+  };
+
+  const handleExport = async (format: "html" | "json" | "zip") => {
+    setOpen(null);
+    try {
+      const out = await saveReportDialog({ format, caseNumber });
+      if (!out) return;
+      const segPayload = segments.map((s) => ({
+        index: s.index,
+        startMs: s.startMs ?? null,
+        endMs: s.endMs ?? null,
+        originalText: s.originalText,
+        translatedText: s.translatedText,
+        speakerId: s.speakerId ?? null,
+      }));
+      await exportReport({
+        format,
+        outputPath: out,
+        caseNumber,
+        sourceLang: sourceLang.code,
+        targetLang: targetLang.code,
+        dialect: dialect ? dialect.dialect : null,
+        segments: segPayload,
+      });
+    } catch (err) {
+      setError(`Export failed: ${String(err)}`);
+    }
+  };
+
+  const Item = ({
+    label,
+    onClick,
+    shortcut,
+  }: {
+    label: string;
+    onClick: () => void;
+    shortcut?: string;
+  }) => (
+    <button type="button" className="menu-item" onClick={onClick}>
+      <span>{label}</span>
+      {shortcut && <span className="menu-shortcut">{shortcut}</span>}
+    </button>
+  );
+
+  return (
+    <div className="menubar" ref={ref}>
+      {(["File", "View", "Models", "Help"] as const).map((m) => (
+        <div
+          key={m}
+          className={`menu ${open === m ? "is-open" : ""}`}
+        >
+          <button
+            type="button"
+            className="menu-button"
+            onClick={() => setOpen(open === m ? null : m)}
+          >
+            {m}
+          </button>
+          {open === m && (
+            <div className="menu-dropdown">
+              {m === "File" && (
+                <>
+                  <Item
+                    label="Open Evidence…"
+                    onClick={handleOpen}
+                    shortcut="⌘O"
+                  />
+                  <div className="menu-divider" />
+                  <Item
+                    label="Export Report → HTML"
+                    onClick={() => handleExport("html")}
+                  />
+                  <Item
+                    label="Export Report → JSON"
+                    onClick={() => handleExport("json")}
+                  />
+                  <Item
+                    label="Export ZIP package"
+                    onClick={() => handleExport("zip")}
+                  />
+                  <div className="menu-divider" />
+                  <Item
+                    label="Set Case Number…"
+                    onClick={() => {
+                      setOpen(null);
+                      onSetCaseNumber();
+                    }}
+                  />
+                </>
+              )}
+              {m === "View" && (
+                <>
+                  <Item
+                    label="Document View"
+                    onClick={() => {
+                      setForceTranscript(false);
+                      setOpen(null);
+                    }}
+                  />
+                  <Item
+                    label="Transcript View"
+                    onClick={() => {
+                      setForceTranscript(true);
+                      setOpen(null);
+                    }}
+                  />
+                  <div className="menu-divider" />
+                  <Item
+                    label="Toggle Dialect Card"
+                    onClick={() => {
+                      toggleDialect();
+                      setOpen(null);
+                    }}
+                  />
+                  <Item
+                    label="Toggle Code-Switch Bands"
+                    onClick={() => {
+                      toggleBands();
+                      setOpen(null);
+                    }}
+                  />
+                </>
+              )}
+              {m === "Models" && (
+                <>
+                  <Item
+                    label="Open Model Manager"
+                    onClick={() => {
+                      setOpen(null);
+                      onOpenModelManager();
+                    }}
+                  />
+                </>
+              )}
+              {m === "Help" && (
+                <>
+                  <Item
+                    label="About AUGUR"
+                    onClick={() => {
+                      setOpen(null);
+                      window.alert("AUGUR v1.0.0 — Wolfmark Systems");
+                    }}
+                  />
+                  <Item
+                    label="MT Advisory Notice"
+                    onClick={() => {
+                      setOpen(null);
+                      onOpenAdvisory();
+                    }}
+                  />
+                </>
+              )}
+            </div>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}

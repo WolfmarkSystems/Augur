@@ -21,6 +21,8 @@ exclude = [
     # Excluded so the heavy GUI dep tree is not pulled into the
     # default `cargo build --workspace`.
     "apps/augur-installer/src-tauri",
+    # Sprint 12 — desktop GUI, same exclusion rationale.
+    "apps/augur-desktop/src-tauri",
 ]
 
 [workspace.package]

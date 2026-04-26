@@ -1,0 +1,40 @@
+[package]
+name = "augur-desktop"
+version = "1.0.0"
+edition = "2021"
+description = "AUGUR Desktop GUI — Tauri main application."
+license = "Proprietary"
+authors = ["Wolfmark Systems"]
+
+# Excluded from the root cargo workspace (see ../../../Cargo.toml
+# [workspace.exclude]). Build standalone:
+#   cd apps/augur-desktop/src-tauri && cargo build
+
+[lib]
+name = "augur_desktop_lib"
+path = "src/lib.rs"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "augur-desktop"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-shell = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "io-util", "process", "time"] }
+sha2 = "0.10"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+log = "0.4"
+env_logger = "0.11"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
