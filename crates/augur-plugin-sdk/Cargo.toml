@@ -1,0 +1,33 @@
+[package]
+name = "augur-plugin-sdk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Strata plugin adapter — exposes AUGUR translations as Strata-shaped artifacts."
+
+[dependencies]
+augur-core = { path = "../augur-core" }
+augur-translate = { path = "../augur-translate" }
+augur-classifier = { path = "../augur-classifier" }
+augur-stt = { path = "../augur-stt" }
+augur-ocr = { path = "../augur-ocr" }
+log = { workspace = true }
+thiserror = { workspace = true }
+serde_json = "1"
+# Optional path dependency on the upstream Strata plugin SDK.
+# Sibling-workspace layout: ~/Wolfmark/strata next to ~/Wolfmark/augur.
+# The crate pulls in strata-fs for VirtualFilesystem, which is a
+# large dependency tree (NTFS / APFS / ext4 / EWF / etc.). AUGUR
+# does not need this for its standalone build, so we keep it
+# optional behind the `strata` feature — default build stays lean
+# (matches the no-unnecessary-deps hard rule).
+strata-plugin-sdk = { path = "../../vendor/strata-plugin-sdk", optional = true }
+
+[features]
+default = []
+# Build the real `impl StrataPlugin for AugurStrataPlugin`. Pulls
+# in strata-plugin-sdk + strata-fs and only resolves when the
+# sibling Strata workspace is available at the path above. Run
+# `cargo build --features strata-plugin-sdk/strata` to enable.
+strata = ["dep:strata-plugin-sdk"]

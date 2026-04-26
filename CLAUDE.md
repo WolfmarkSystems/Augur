@@ -1,20 +1,20 @@
-# VERIFY — Claude Code Guidelines
+# AUGUR — Claude Code Guidelines
 
-VERIFY is a forensic translation and transcription tool. It surfaces
+AUGUR is a forensic translation and transcription tool. It surfaces
 foreign-language content inside digital evidence — text, audio,
 video, and images — translating it into the examiner's working
 language without requiring an internet connection.
 
 Two shipping modes, one codebase:
-- **Standalone binary** — `verify translate --input evidence.mp4 --target en`
-- **Strata plugin** — loaded via `strata-plugin-sdk`; VERIFY's
+- **Standalone binary** — `augur translate --input evidence.mp4 --target en`
+- **Strata plugin** — loaded via `strata-plugin-sdk`; AUGUR's
   artifacts surface in the Strata UI alongside the forensic plugins.
 
 ---
 
 ## OFFLINE INVARIANT — hard architectural requirement
 
-VERIFY is offline-first by design. **No translation request, no
+AUGUR is offline-first by design. **No translation request, no
 audio file, no image, and no classified content ever leaves the
 examiner's machine.** This is non-negotiable.
 
@@ -24,9 +24,9 @@ Every feature that requires a network call must be:
 3. Gated behind an explicit `--online` flag in the CLI
 
 The only permitted network egress in the default path is the
-**first-run model download** in `verify-classifier::ModelManager`
-(fastText `lid.176.ftz`, ~900 KB) and `verify-stt`'s Whisper
-preset downloads — both cached under `~/.cache/verify/models/`.
+**first-run model download** in `augur-classifier::ModelManager`
+(fastText `lid.176.ftz`, ~900 KB) and `augur-stt`'s Whisper
+preset downloads — both cached under `~/.cache/augur/models/`.
 
 Before shipping any code, confirm: does this function make a
 network call? If yes, it is not in the default path, it is
@@ -57,8 +57,8 @@ opt-in API.
 - All errors handled explicitly — no silent failures.
 - Every error path either propagates with `?`, logs via
   `log::warn!` / `log::error!`, or surfaces to the caller as a
-  typed `VerifyError` variant.
-- Sub-crates map their internal errors into `VerifyError` at
+  typed `AugurError` variant.
+- Sub-crates map their internal errors into `AugurError` at
   their public boundary. Callers never need to juggle a pile
   of unrelated error enums.
 
@@ -85,44 +85,44 @@ opt-in API.
 
 ## Crate responsibilities
 
-- **`verify-core`** — pipeline orchestrator. Owns the unified
-  `VerifyError` type and the `Pipeline` entry point. Sub-crates
-  map their errors into `VerifyError` at their public boundary.
+- **`augur-core`** — pipeline orchestrator. Owns the unified
+  `AugurError` type and the `Pipeline` entry point. Sub-crates
+  map their errors into `AugurError` at their public boundary.
   No ML, no audio, no OCR logic lives here — just the
   dispatch + glue.
 
-- **`verify-classifier`** — language identification. The router
+- **`augur-classifier`** — language identification. The router
   that runs in front of the heavy pipeline. fastText LID
   (`lid.176.ftz`, 176 languages) or `whichlang` (pure-Rust
   fallback) — final choice documented inline when picked.
   Decides whether a given text is foreign vs the examiner's
   target language and routes the correct pipeline to it.
 
-- **`verify-stt`** — Whisper speech-to-text. Three model
+- **`augur-stt`** — Whisper speech-to-text. Three model
   presets (Fast / Balanced / Accurate) with size + URL
   constants in the `WhisperPreset` enum. Audio preprocessing
   to 16 kHz mono f32 PCM via `hound` (WAV) or `ffmpeg`
   subprocess (everything else). Emits `SttResult` with a full
   transcript, detected language, and timestamped segments.
 
-- **`verify-translate`** — NLLB-200 translation. Sprint 1 is a
+- **`augur-translate`** — NLLB-200 translation. Sprint 1 is a
   stub (`translate_stub` returns `TRANSLATION_STUB`); Sprint 2
   wires Meta's NLLB-200 model for 200-language offline
   translation. Every call takes source language + target
   language explicitly so the classifier's output feeds the
   translator directly.
 
-- **`verify-ocr`** — Tesseract image OCR. Sprint 1 stub;
+- **`augur-ocr`** — Tesseract image OCR. Sprint 1 stub;
   Sprint 2 wires `leptess` bindings + language packs so
   foreign-language text in screenshots / scans / photos can
   be lifted out and handed to the translator.
 
-- **`verify-plugin-sdk`** — Strata plugin adapter. Sprint 1
+- **`augur-plugin-sdk`** — Strata plugin adapter. Sprint 1
   stub; Sprint 2 wires `strata-plugin-sdk::StrataPlugin` so
-  VERIFY surfaces inside Strata as an artifact emitter
+  AUGUR surfaces inside Strata as an artifact emitter
   (`mitre_technique = T1005`).
 
-- **`verify-cli` (under `apps/`)** — the `verify` binary.
+- **`augur-cli` (under `apps/`)** — the `augur` binary.
   Three subcommands (`classify` / `transcribe` / `translate`).
   Fully offline by default; `--online` opt-in for
   not-yet-scoped online features (none in Sprint 1).
@@ -132,13 +132,13 @@ opt-in API.
 ## Key architectural decisions
 
 - **Weights are downloaded on first run, cached under
-  `~/.cache/verify/models/` (XDG-compliant).** `ModelManager`
+  `~/.cache/augur/models/` (XDG-compliant).** `ModelManager`
   owns this logic. Every download verifies file size before
   accepting the artifact. Weights are NEVER committed to git
   (see `.gitignore`).
 
 - **The fastText classifier is the router, not a nice-to-have.**
-  An examiner with a 500 GB image should not wait for VERIFY
+  An examiner with a 500 GB image should not wait for AUGUR
   to fully translate every text blob. The classifier runs on
   every input first; only the foreign subset is queued for
   STT + NLLB. Keeping the classifier lightweight is a design
@@ -161,7 +161,7 @@ opt-in API.
   that hint is propagated.
 
 - **Two shipping modes share a pipeline.** The standalone
-  CLI and the Strata plugin both go through `verify-core`'s
+  CLI and the Strata plugin both go through `augur-core`'s
   `Pipeline`. The plugin adapter translates pipeline results
   into `ArtifactRecord`s; the CLI formats them for stdout.
   No divergent code paths — same results in both modes.
@@ -180,7 +180,7 @@ opt-in API.
   audio preprocessing, 3 unit tests.
 - CLI wiring (P4) — `classify` / `transcribe` / `translate`
   subcommands via `clap`. `translate` prints the
-  `TRANSLATION_STUB` sentinel from `verify-translate` in
+  `TRANSLATION_STUB` sentinel from `augur-translate` in
   Sprint 1 — replaced by real NLLB in Sprint 2.
 
 ## Sprint 2 decisions (shipped 2026-04-25)
@@ -190,39 +190,39 @@ opt-in API.
   `metal` feature; no cmake / FFI. We fetch safetensors weights
   from `openai/whisper-{tiny,base,large-v3}` via `hf-hub`, bundle
   the 80-bin and 128-bin mel filter banks under
-  `crates/verify-stt/assets/`, and run a greedy decoder with
+  `crates/augur-stt/assets/`, and run a greedy decoder with
   timestamp tokens to produce per-segment `[start_ms, end_ms,
   text]` tuples. The Sprint 1 GGML URL constants were retired —
   candle reads safetensors only.
 - **NLLB-200 translation — Python + transformers subprocess.**
   candle does not ship NLLB's MBart-style architecture, so per
   the decision rule we ship Option B: a bundled
-  `crates/verify-translate/src/script.py` driven by `python3 -c`
+  `crates/augur-translate/src/script.py` driven by `python3 -c`
   per call. HF cache is forced under
-  `~/.cache/verify/models/nllb/` via `VERIFY_HF_CACHE`. The model
+  `~/.cache/augur/models/nllb/` via `AUGUR_HF_CACHE`. The model
   is `facebook/nllb-200-distilled-600M`. ctranslate2 (Option C)
   is a drop-in performance upgrade — same script shape.
 - **Machine-translation advisory is load-bearing.** Every
   `TranslationResult` carries `is_machine_translation = true` and
   a non-empty `advisory_notice`. The CLI prints the notice on
   every translate run; there is no suppression flag. The
-  `verify_translate::tests::machine_translation_advisory_always_present`
+  `augur_translate::tests::machine_translation_advisory_always_present`
   test pins this invariant in the build.
 - **Tesseract OCR — subprocess (no `tesseract` installed at build
   time).** Same pattern as `ffmpeg` for audio: spawn the
   `tesseract` CLI with `<input> stdout -l <lang>`. The `tesseract`
   / `leptess` Rust crates require `libtesseract`+`libleptonica`
-  system libs; subprocessing keeps VERIFY's pure-Rust build
+  system libs; subprocessing keeps AUGUR's pure-Rust build
   story intact and avoids C/C++ FFI inside the binary.
-- **Pipeline orchestration lives in the CLI.** `verify-core`
+- **Pipeline orchestration lives in the CLI.** `augur-core`
   exposes the data shapes (`PipelineInput`, `PipelineResult`,
   `TimedSegment`) but does not depend on the engines —
   introducing such a dep would cycle (each engine already
-  depends on `verify-core` for `VerifyError`). The CLI wires
+  depends on `augur-core` for `AugurError`). The CLI wires
   classifier + STT + OCR + translation directly. A future
-  `verify-pipeline` crate can house this glue if a second
+  `augur-pipeline` crate can house this glue if a second
   embedder (e.g. the real Strata plugin) needs it.
-- **`verify-plugin-sdk` adapter shape only.** Upstream
+- **`augur-plugin-sdk` adapter shape only.** Upstream
   `strata-plugin-sdk` is not yet vendored into this workspace,
   so we ship the `ArtifactRecord` + `Confidence` + plugin
   metadata shapes plus the `artifact_from_translation` converter.
@@ -232,9 +232,9 @@ opt-in API.
 ## Sprint 3 decisions (shipped 2026-04-25)
 
 - **Video pipeline — ffmpeg `-vn` audio extraction.** New
-  `verify_stt::extract_audio_from_video` writes a 16 kHz mono WAV
+  `augur_stt::extract_audio_from_video` writes a 16 kHz mono WAV
   to a scratch dir and hands off to the Sprint 2 STT path.
-  `PipelineInput::Video` was added to verify-core; the CLI auto-
+  `PipelineInput::Video` was added to augur-core; the CLI auto-
   detects video by extension via `detect_input_kind` (mp4/mov/
   avi/mkv/m4v/wmv/webm/3gp). Translated transcripts preserve
   per-segment timestamps via `TranslationEngine::translate_segments`,
@@ -242,7 +242,7 @@ opt-in API.
   `[start_ms, end_ms, source_text, translated_text]` tuples on
   the result.
 - **ctranslate2 NLLB swap with graceful fallback.** A second
-  bundled worker script (`crates/verify-translate/src/script_ct2.py`)
+  bundled worker script (`crates/augur-translate/src/script_ct2.py`)
   runs the same `facebook/nllb-200-distilled-600M` via ctranslate2.
   `TranslationEngine::backend` is `Backend::Auto` by default,
   preferring ct2 when its converted model exists at
@@ -254,7 +254,7 @@ opt-in API.
   was not run on this build host (sentencepiece + transformers
   were not installed); literature reports 3–5× CPU speedup, which
   the spec author cited as the motivating gain.
-- **Batch processing.** New `verify batch` subcommand walks a
+- **Batch processing.** New `augur batch` subcommand walks a
   directory recursively, classifies each file, translates the
   foreign-language ones, and writes a JSON report carrying the
   mandatory machine-translation notice at the top level. Per-file
@@ -264,15 +264,15 @@ opt-in API.
   `std::fs::read_dir` recursively rather than pulling in
   `walkdir` — fewer deps.
 - **Real Strata plugin trait — feature-gated.** Vendoring the
-  full Strata `strata-plugin-sdk` tree into VERIFY pulls
+  full Strata `strata-plugin-sdk` tree into AUGUR pulls
   `strata-fs`, which transitively requires NTFS/APFS/ext4/EWF
   filesystem parsers. That violates the "no unnecessary
   dependencies" hard rule for a translation tool. Resolution: the
-  real `impl StrataPlugin for VerifyStrataPlugin` lives behind
-  the `strata` feature in `verify-plugin-sdk` and is a path
+  real `impl StrataPlugin for AugurStrataPlugin` lives behind
+  the `strata` feature in `augur-plugin-sdk` and is a path
   dependency to `~/Wolfmark/strata/crates/strata-plugin-sdk`
   (sibling workspace). Default build stays lean; `cargo build
-  --features verify-plugin-sdk/strata` opts in. The advisory
+  --features augur-plugin-sdk/strata` opts in. The advisory
   notice survives Strata's `ArtifactRecord` shape (which has no
   `is_advisory` field) by living in two places: a `[MT — review
   by a certified human translator]` prefix on the artifact
@@ -288,7 +288,7 @@ opt-in API.
 ## Sprint 4 decisions (shipped 2026-04-25)
 
 - **whichlang is now the production default classifier.** Sprint 1
-  diagnostic (`crates/verify-classifier/examples/lid_label_probe.rs`,
+  diagnostic (`crates/augur-classifier/examples/lid_label_probe.rs`,
   feature-gated as `fasttext-probe`) confirmed the
   `fasttext = "0.8.0"` crate is NOT binary-compatible with
   Meta's published `lid.176.ftz`: Arabic classifies as
@@ -302,7 +302,7 @@ opt-in API.
   example is committed as feature-gated. Sprint 5 evaluates
   `fasttext-pure-rs` as a 176-language replacement.
 - **Whisper temperature fallback (per-segment).** New
-  `verify_stt::TranscribeOptions` exposes the standard OpenAI
+  `augur_stt::TranscribeOptions` exposes the standard OpenAI
   parameters (`temperature`, `temperature_increment`,
   `max_temperature_retries`, `no_speech_threshold`,
   `compression_ratio_threshold`, `rng_seed`). Each 30-second mel
@@ -313,16 +313,16 @@ opt-in API.
   next temperature step (sampling from `softmax(logits/T)`
   instead of argmax). The `rng_seed` default is fixed for
   forensic reproducibility — same audio + same seed produces
-  identical transcripts. CLI: `verify transcribe --temperature
+  identical transcripts. CLI: `augur transcribe --temperature
   0.0 --max-retries 5`.
 - **PDF input** auto-routed by extension. New
-  `verify_ocr::extract_pdf_text` tries the pure-Rust
+  `augur_ocr::extract_pdf_text` tries the pure-Rust
   `pdf-extract` text layer first (handles digitally-generated
   PDFs with no system deps); falls back to a `pdftoppm` (poppler)
   rasterize step + per-page Tesseract OCR for scanned PDFs.
-  Missing `pdftoppm` returns a clear `VerifyError::Ocr` with the
+  Missing `pdftoppm` returns a clear `AugurError::Ocr` with the
   install hint. PDFs flow through the standard
-  classifier → NLLB pipeline; `verify batch --types audio,video,image,pdf`
+  classifier → NLLB pipeline; `augur batch --types audio,video,image,pdf`
   honors them.
 - **ctranslate2 benchmark (M1 Max, NLLB-200-distilled-600M, INT8).**
   Same 98-word forensic-style Arabic paragraph
@@ -348,7 +348,7 @@ opt-in API.
 
 - **`fasttext-pure-rs` confirmed binary-compatible with
   `lid.176.ftz` — replaces the broken `fasttext = "0.8"` crate.**
-  Sprint 5 P1 probe (`crates/verify-classifier/examples/lid_pure_probe.rs`,
+  Sprint 5 P1 probe (`crates/augur-classifier/examples/lid_pure_probe.rs`,
   feature-gated as `fasttext-probe`): Arabic / Chinese / Russian /
   Spanish / Persian / Urdu all classify correctly with high
   confidence (0.96–0.99 on the major languages). Pashto confuses
@@ -359,17 +359,17 @@ opt-in API.
   `fasttext = "0.8"` dep; the live integration tests
   (`fasttext_pure_rs_classifies_arabic_correctly`,
   `fasttext_pure_rs_classifies_forensic_languages`) gate on
-  `VERIFY_RUN_INTEGRATION_TESTS=1`.
+  `AUGUR_RUN_INTEGRATION_TESTS=1`.
 - **Speaker diarization via pyannote.audio subprocess.** New
-  `verify-stt::diarize` module: `DiarizationEngine`,
+  `augur-stt::diarize` module: `DiarizationEngine`,
   `DiarizationSegment`, `EnrichedSegment`, `HfTokenManager`,
   bundled `diarize.py` worker. Same offline-first contract as
-  the NLLB workers — `~/.cache/verify/models/pyannote/` for
+  the NLLB workers — `~/.cache/augur/models/pyannote/` for
   weights, JSON-over-stdio for IO. The HF token (required to
   download the gated `pyannote/speaker-diarization-3.1` model)
-  lives at `~/.cache/verify/hf_token` (chmod 0600 on Unix);
-  `verify setup --hf-token <T>` writes it. Diarization is opt-in
-  via `verify translate --diarize`; default behavior is
+  lives at `~/.cache/augur/hf_token` (chmod 0600 on Unix);
+  `augur setup --hf-token <T>` writes it. Diarization is opt-in
+  via `augur translate --diarize`; default behavior is
   unchanged. STT segments are merged with diarization segments
   by maximum temporal overlap (`merge_stt_with_diarization`);
   the CLI prints the resulting `EnrichedSegment` stream as
@@ -378,13 +378,13 @@ opt-in API.
   inputs ignore the flag with an explicit log line.
 - **Air-gap package for offline-only deployments.** New
   `scripts/build_airgap_package.sh` produces
-  `verify-airgap-<preset>-<date>.tar.gz` containing
+  `augur-airgap-<preset>-<date>.tar.gz` containing
   `lid.176.ftz`, the chosen Whisper preset (tiny/base/large-v3),
   the NLLB-200-distilled-600M snapshot, and an `install.sh` that
-  copies them into `~/.cache/verify/models/` on the destination
+  copies them into `~/.cache/augur/models/` on the destination
   machine. The Rust-side
-  `verify_classifier::ModelManager::ensure_lid_model()` now
-  consults `VERIFY_AIRGAP_PATH` before any network egress;
+  `augur_classifier::ModelManager::ensure_lid_model()` now
+  consults `AUGUR_AIRGAP_PATH` before any network egress;
   pre-staged weights short-circuit the curl path. Documented in
   `docs/AIRGAP_INSTALL.md`. Both Whisper and NLLB use Hugging
   Face's own cache layout, so the install script populates those
@@ -394,7 +394,7 @@ opt-in API.
 ## Sprint 6 decisions (shipped 2026-04-26 — overnight run)
 
 - **Batch report — CSV output + aggregate summary + progress
-  file.** `verify batch --output report.csv` emits an
+  file.** `augur batch --output report.csv` emits an
   RFC-4180-escaped CSV (`render_batch_csv` + `BATCH_CSV_HEADER`).
   Any other extension serializes JSON. The JSON form now carries
   a `summary` field (`BatchSummary`) with `total_files /
@@ -416,11 +416,11 @@ opt-in API.
   advisory. The CLI prints the tier + word count + advisory on
   every classification; the batch JSON / CSV per-file rows
   carry `confidence_tier` and `confidence_advisory` fields.
-- **`verify self-test [--full]`** — pre-deployment readiness
+- **`augur self-test [--full]`** — pre-deployment readiness
   check. Default form is fully offline: 11 checks covering
   classification (Arabic / English / empty), tooling
   availability (ffmpeg / tesseract / pdftoppm), model-cache
-  filesystem state (Whisper, NLLB), `VERIFY_AIRGAP_PATH`, and
+  filesystem state (Whisper, NLLB), `AUGUR_AIRGAP_PATH`, and
   HF-token presence. `--full` adds an end-to-end translation
   check that asserts the mandatory MT advisory survives the
   inference path; missing Python / transformers degrades it to
@@ -440,34 +440,34 @@ opt-in API.
 ## Sprint 7 decisions (shipped 2026-04-26)
 
 - **IP geolocation via MaxMind GeoLite2.** New
-  `verify_core::geoip` module — `GeoIpEngine`, `GeoIpResult`,
+  `augur_core::geoip` module — `GeoIpEngine`, `GeoIpResult`,
   `is_private` (RFC 1918 + loopback + link-local + IPv4 CGN +
   IPv6 ULA + multicast), `configured_db_path`, `check_status`.
   Uses the pure-Rust `maxminddb = "0.28"` crate; the 0.28 API
   shape (`Reader::lookup → LookupResult.decode::<geoip2::City>`)
   is wrapped at our layer. **MaxMind license bars auto-
-  download**, so VERIFY does NOT fetch the database itself —
-  examiners place the file at `$VERIFY_GEOIP_PATH` or
-  `~/.cache/verify/GeoLite2-City.mmdb`. Missing-DB returns the
-  new `VerifyError::GeoIpNotConfigured(...)` variant carrying
+  download**, so AUGUR does NOT fetch the database itself —
+  examiners place the file at `$AUGUR_GEOIP_PATH` or
+  `~/.cache/augur/GeoLite2-City.mmdb`. Missing-DB returns the
+  new `AugurError::GeoIpNotConfigured(...)` variant carrying
   the install instructions; never panics, never silently falls
-  back. CLI: `verify geoip <ip>` / `--input ips.txt` /
-  `--setup`. `verify self-test` reports the DB status as a new
+  back. CLI: `augur geoip <ip>` / `--input ips.txt` /
+  `--setup`. `augur self-test` reports the DB status as a new
   Pass/Skip check.
-- **Batch report customization.** New `verify_core::report`
+- **Batch report customization.** New `augur_core::report`
   module — `ReportConfig` (agency / case / examiner / badge /
   classification / report title / logo / boolean toggles),
   TOML serializer/deserializer, `metadata_json` block,
   `render_batch_html` self-contained HTML renderer. CLI: `verify
-  config init|show|set` writes / reads `~/.verify_report.toml`;
-  `verify batch --config <path> --format html|json|csv|auto`
+  config init|show|set` writes / reads `~/.augur_report.toml`;
+  `augur batch --config <path> --format html|json|csv|auto`
   threads it into the batch report. The forensic invariant is
   pinned at the schema level: `include_mt_advisory` is forced
   to `true` on load even if the on-disk TOML attempts `false`,
   and the HTML renderer emits the MT notice both at the top
   and bottom of the document. User-supplied strings are
   HTML-escaped against XSS in the rendered HTML.
-- **Forensic timestamp converter.** New `verify_core::timestamps`
+- **Forensic timestamp converter.** New `augur_core::timestamps`
   module — `TimestampFormat::{UnixSeconds | UnixMs | UnixUs |
   UnixNs | AppleCoreData | AppleNs | WindowsFiletime | WebKit |
   HfsPlus | CocoaDate}`, `convert(value, format)` and
@@ -475,16 +475,16 @@ opt-in API.
   interpretations ranked by confidence. ISO-8601 UTC formatting
   is hand-rolled via Howard Hinnant's civil-date algorithm so
   we don't pull in `chrono` for one date helper. CLI:
-  `verify timestamp <value>` (auto-list) /
-  `verify timestamp <value> --format windows-filetime` (single)
-  / `verify timestamp --input file.txt` (batch). 9 unit tests
+  `augur timestamp <value>` (auto-list) /
+  `augur timestamp <value> --format windows-filetime` (single)
+  / `augur timestamp --input file.txt` (batch). 9 unit tests
   pin every reference conversion (Unix epoch ↔ Windows FILETIME
   ↔ WebKit ↔ Apple ↔ HFS+).
 
 ## Sprint 8 decisions (shipped 2026-04-26)
 
 - **Strata plugin SDK vendored locally with a minimal `strata-fs`
-  stub.** Sprint 5 built the `--features verify-plugin-sdk/strata`
+  stub.** Sprint 5 built the `--features augur-plugin-sdk/strata`
   trait impl behind a path dep at `~/Wolfmark/strata/...`; that
   path was fragile to user directory layout. Sprint 8 vendors
   `strata-plugin-sdk` to `vendor/strata-plugin-sdk/` and ships a
@@ -494,7 +494,7 @@ opt-in API.
   invokes). Workspace `[workspace.exclude]` keeps the vendored
   crates out of `cargo build --workspace`; they're pulled in
   only when the strata feature is on. Default build stays
-  small; `cargo build --features verify-plugin-sdk/strata`
+  small; `cargo build --features augur-plugin-sdk/strata`
   succeeds without the sibling Strata workspace. Two new
   feature-gated tests pin: walker emits no artifacts on a
   non-foreign tempdir, and every artifact `walk_and_translate`
@@ -525,7 +525,7 @@ opt-in API.
   diarization runs, then the CLI cleans it up. `pyannote.audio`
   reads audio rather than video containers, so this hand-off
   matters. New `SPEAKER_DIARIZATION_ADVISORY` const in
-  `verify-stt::diarize` is non-suppressible at the same level
+  `augur-stt::diarize` is non-suppressible at the same level
   as the MT advisory: whenever the CLI prints a diarized
   transcript, both advisories fire (MT first, speaker second
   — never one without the other). The advisory text spells out
@@ -535,7 +535,7 @@ opt-in API.
 ## Sprint 9 decisions (shipped 2026-04-26)
 
 - **Pashto/Farsi script disambiguation.** New
-  `verify_classifier::script` module: `pashto_farsi_score(text)`
+  `augur_classifier::script` module: `pashto_farsi_score(text)`
   returns a `PashtoFarsiAnalysis` with per-side glyph counts +
   recommendation + confidence. The classifier's `classify()`
   invokes the disambiguator whenever the LID layer reports
@@ -548,7 +548,7 @@ opt-in API.
   self-test` gains a check that drives the analyzer on a
   Pashto-heavy probe.
 - **Parallel batch processing via rayon.** New `--threads <N>`
-  flag on `verify batch` (and the new `verify package`); `0`
+  flag on `augur batch` (and the new `augur package`); `0`
   (the default) resolves to `min(num_cpus, 8)` to keep STT
   model loads from blowing memory on large evidence runs.
   Per-file `process_one_file` calls already construct their
@@ -560,8 +560,8 @@ opt-in API.
   1.62 s → **5.59× speedup**, 557% CPU. The
   `write_progress_snapshot` helper takes a pre-cloned `&[String]`
   so the lock is held only across vec push, not the JSON write.
-- **Evidence package export.** New `verify package` subcommand
-  + `apps/verify-cli/src/package.rs` module. Produces a ZIP
+- **Evidence package export.** New `augur package` subcommand
+  + `apps/augur-cli/src/package.rs` module. Produces a ZIP
   containing `MANIFEST.json` (per-file SHA-256 hashes computed
   in 64 KiB chunks), `CHAIN_OF_CUSTODY.txt`, `REPORT.html` +
   `REPORT.json`, and `translations/<filename>.<target>.txt`
@@ -577,7 +577,7 @@ opt-in API.
 ## Super Sprint decisions (shipped 2026-04-26)
 
 - **Group A — Arabic dialect detection.** New
-  `verify_classifier::arabic_dialect` module: `ArabicDialect`
+  `augur_classifier::arabic_dialect` module: `ArabicDialect`
   enum (Modern Standard, Egyptian, Levantine, Gulf, Iraqi,
   Moroccan, Yemeni, Sudanese, Unknown) +
   `detect_arabic_dialect(text)` lexical-marker scorer.
@@ -589,33 +589,33 @@ opt-in API.
   forensic advisory always tells the examiner to verify
   dialect calls with a human linguist.
 - **Group B P2 — SRT/VTT subtitle support.** New
-  `verify_core::subtitle` module: `SubtitleEntry`,
+  `augur_core::subtitle` module: `SubtitleEntry`,
   `parse_srt`, `parse_vtt`, `render_srt`, `render_vtt`,
   timestamp helpers. `PipelineInput::Subtitle` routed by
-  extension. CLI flag `verify translate --output-srt <path>`
+  extension. CLI flag `augur translate --output-srt <path>`
   re-runs translation per cue and writes a media-player-ready
   translated SRT, preserving the original timestamps.
 - **Group B P3 — YARA pattern integration (subprocess).** New
-  `verify_core::yara_scan` module wraps the `yara` CLI binary
+  `augur_core::yara_scan` module wraps the `yara` CLI binary
   (same pattern as `ffmpeg`/`tesseract`). New
-  `VerifyError::Yara` + `VerifyError::YaraNotInstalled`
+  `AugurError::Yara` + `AugurError::YaraNotInstalled`
   variants. Built-in starter rules at
   `data/yara_rules/starter.yar` (BTC / ETH wallets, URLs,
   Tor onion addresses, phone numbers, emails, IPv4). CLI
-  flag `--yara-rules <path>` on `verify translate` scans
+  flag `--yara-rules <path>` on `augur translate` scans
   both translated and original text. Subprocess approach
   avoids the libyara system dep.
 - **Group C P4 — error recovery.** New
-  `verify_core::resilience` module: `PipelineLimits` with
+  `augur_core::resilience` module: `PipelineLimits` with
   sane defaults (500 MB file / 10 MB text / 500 PDF pages /
   10 000 batch files / 5 min timeout); `check_file_size`,
   `check_text_size`, `with_retry(max_attempts, f)` (linear
-  backoff). New `VerifyError::FileTooLarge`,
-  `VerifyError::CorruptFile`, `VerifyError::ProcessTimeout`
+  backoff). New `AugurError::FileTooLarge`,
+  `AugurError::CorruptFile`, `AugurError::ProcessTimeout`
   variants.
 - **Group C P5 — benchmarking suite.** Five fixtures under
   `tests/benchmarks/` (Arabic short/medium/long, mixed
-  languages, Pashto sample). New `verify benchmark` subcommand
+  languages, Pashto sample). New `augur benchmark` subcommand
   with `--full` for translation + `--compare <prev.json>`
   for regression detection (>1.2× baseline → flagged).
   `BenchmarkSuite` JSON serialises round-trip; whichlang
@@ -624,7 +624,7 @@ opt-in API.
 - **Group D P6 — Strata live integration.** Added
   `strata_plugin_processes_real_arabic_evidence` integration
   test (`#[ignore]`-gated on
-  `VERIFY_RUN_INTEGRATION_TESTS=1`) and
+  `AUGUR_RUN_INTEGRATION_TESTS=1`) and
   `strata_plugin_metadata_complete` regression test. Wrote
   `docs/STRATA_INTEGRATION.md` covering build, registration,
   artifact shape, and forensic invariants.
@@ -641,7 +641,7 @@ opt-in API.
   `docs/USER_MANUAL.md`, `docs/QUICK_REFERENCE.md`,
   `docs/DEPLOYMENT.md`, and a fresh `README.md` (rewritten
   from developer-facing to examiner-facing). New
-  `verify docs [topic]` subcommand prints the relevant
+  `augur docs [topic]` subcommand prints the relevant
   bundled doc directly from the binary (`include_str!`-baked,
   works on air-gapped machines without source).
 

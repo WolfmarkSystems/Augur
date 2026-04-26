@@ -1,25 +1,25 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/verify-core",
-    "crates/verify-classifier",
-    "crates/verify-stt",
-    "crates/verify-translate",
-    "crates/verify-ocr",
-    "crates/verify-plugin-sdk",
-    "apps/verify-cli",
+    "crates/augur-core",
+    "crates/augur-classifier",
+    "crates/augur-stt",
+    "crates/augur-translate",
+    "crates/augur-ocr",
+    "crates/augur-plugin-sdk",
+    "apps/augur-cli",
 ]
 # Vendored Strata plugin SDK + minimal strata-fs stub
 # (Sprint 8 P1). Excluded from the workspace so they are NOT
 # built as part of `cargo build --workspace`; they're pulled in
-# only when `verify-plugin-sdk/strata` feature is on.
+# only when `augur-plugin-sdk/strata` feature is on.
 exclude = [
     "vendor/strata-plugin-sdk",
     "vendor/strata-fs",
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 license = "Proprietary"
 authors = ["Wolfmark Systems"]

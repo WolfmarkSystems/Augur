@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # build_airgap_package.sh — Sprint 5 P3
 #
-# Build a VERIFY air-gap package containing every model weight the
+# Build a AUGUR air-gap package containing every model weight the
 # tool needs at runtime. Run this on an internet-connected machine,
 # transfer the resulting tarball via USB, and unpack on the
 # air-gapped workstation. See docs/AIRGAP_INSTALL.md.
@@ -30,7 +30,7 @@ esac
 
 NLLB_MODEL="facebook/nllb-200-distilled-600M"
 DATE_STAMP="$(date +%Y%m%d)"
-OUTPUT="$OUT_DIR/verify-airgap-${PRESET}-${DATE_STAMP}.tar.gz"
+OUTPUT="$OUT_DIR/augur-airgap-${PRESET}-${DATE_STAMP}.tar.gz"
 STAGING="$(mktemp -d)"
 trap 'rm -rf "$STAGING"' EXIT
 
@@ -63,23 +63,23 @@ PY
 echo "→ Writing install.sh..."
 cat > "$STAGING/install.sh" <<'INSTALL'
 #!/usr/bin/env bash
-# Install VERIFY air-gap models on an offline workstation. Run
+# Install AUGUR air-gap models on an offline workstation. Run
 # this from the unpacked package directory.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
-CACHE="${VERIFY_CACHE_DIR:-$HOME/.cache/verify/models}"
+CACHE="${AUGUR_CACHE_DIR:-$HOME/.cache/augur/models}"
 mkdir -p "$CACHE/whisper" "$CACHE/nllb"
 
 cp "$HERE/lid.176.ftz"         "$CACHE/lid.176.ftz"
 cp -R "$HERE/whisper/."        "$CACHE/whisper/"
 cp -R "$HERE/nllb/."           "$CACHE/nllb/"
 
-echo "✅ VERIFY models installed at $CACHE"
-echo "   Set VERIFY_AIRGAP_PATH=$HERE if you want every run to use the package directly"
+echo "✅ AUGUR models installed at $CACHE"
+echo "   Set AUGUR_AIRGAP_PATH=$HERE if you want every run to use the package directly"
 echo "   instead of the cache copy:"
-echo "     export VERIFY_AIRGAP_PATH=$HERE"
+echo "     export AUGUR_AIRGAP_PATH=$HERE"
 echo "   Verify install:"
-echo "     verify classify --classifier-backend fasttext --text 'مرحبا' --target en"
+echo "     augur classify --classifier-backend fasttext --text 'مرحبا' --target en"
 INSTALL
 chmod +x "$STAGING/install.sh"
 
@@ -88,5 +88,5 @@ tar -czf "$OUTPUT" -C "$STAGING" .
 
 echo "✅ Air-gap package: $OUTPUT"
 echo "   Transfer via USB, then on the air-gapped workstation:"
-echo "     mkdir verify-airgap && tar -xzf $(basename "$OUTPUT") -C verify-airgap"
-echo "     bash verify-airgap/install.sh"
+echo "     mkdir augur-airgap && tar -xzf $(basename "$OUTPUT") -C augur-airgap"
+echo "     bash augur-airgap/install.sh"

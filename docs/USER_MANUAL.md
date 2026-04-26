@@ -1,8 +1,8 @@
-# VERIFY User Manual — v1.0
+# AUGUR User Manual — v1.0
 
 **For law enforcement and intelligence analysts.**
 
-VERIFY is an offline-first foreign-language evidence
+AUGUR is an offline-first foreign-language evidence
 processing tool. It classifies the language of evidence
 (audio, video, image, PDF, subtitle, plain text), runs Whisper
 speech-to-text where applicable, translates the foreign-language
@@ -10,7 +10,7 @@ content to your working language with NLLB-200, and produces
 forensic-grade reports + evidence packages.
 
 **No evidence ever leaves your machine.** All inference runs
-locally. The only network calls VERIFY's default code path
+locally. The only network calls AUGUR's default code path
 makes are first-run model weight downloads, all from named
 constants the source code makes greppable. For air-gapped
 deployments, see [`AIRGAP_INSTALL.md`](AIRGAP_INSTALL.md) — a
@@ -29,44 +29,44 @@ manifest, Strata plugin artifact. It is not suppressible.
 
 ### First-time setup
 ```bash
-verify self-test          # check what's installed (offline)
-verify self-test --full   # exercise full pipeline (downloads models)
+augur self-test          # check what's installed (offline)
+augur self-test --full   # exercise full pipeline (downloads models)
 ```
 
 ### Classify a string
 ```bash
-verify classify --text "مرحبا بالعالم" --target en
+augur classify --text "مرحبا بالعالم" --target en
 ```
 
 ### Translate a single file
 ```bash
-verify translate --input recording.mp3   --target en
-verify translate --input document.pdf    --target en
-verify translate --input interview.mp4   --target en --diarize
-verify translate --input subs.srt        --target en --output-srt subs.en.srt
-verify translate --image photo.png       --target en --ocr-lang ar
+augur translate --input recording.mp3   --target en
+augur translate --input document.pdf    --target en
+augur translate --input interview.mp4   --target en --diarize
+augur translate --input subs.srt        --target en --output-srt subs.en.srt
+augur translate --image photo.png       --target en --ocr-lang ar
 ```
 
 ### Process an evidence directory
 ```bash
-verify batch --input /evidence --target en --output report.json
-verify batch --input /evidence --target en --format html --output report.html
-verify batch --input /evidence --target en --threads 4
-verify batch --input /evidence --target en --types audio,video,pdf
+augur batch --input /evidence --target en --output report.json
+augur batch --input /evidence --target en --format html --output report.html
+augur batch --input /evidence --target en --threads 4
+augur batch --input /evidence --target en --types audio,video,pdf
 ```
 
 ### Package results for sharing
 ```bash
-verify package --input /evidence --output case-001.zip
-verify package --input /evidence --output case-001.zip --include-originals
+augur package --input /evidence --output case-001.zip
+augur package --input /evidence --output case-001.zip --include-originals
 ```
 
 ### Forensic utilities
 ```bash
-verify timestamp 1762276748              # auto-list interpretations
-verify timestamp 1762276748 --format unix-seconds
-verify geoip 8.8.8.8                     # MaxMind GeoLite2 lookup
-verify geoip --setup                     # MaxMind setup instructions
+augur timestamp 1762276748              # auto-list interpretations
+augur timestamp 1762276748 --format unix-seconds
+augur geoip 8.8.8.8                     # MaxMind GeoLite2 lookup
+augur geoip --setup                     # MaxMind setup instructions
 ```
 
 ---
@@ -95,8 +95,8 @@ subcommand.
 
 ## Model setup
 
-VERIFY downloads model weights on first use into
-`~/.cache/verify/models/`:
+AUGUR downloads model weights on first use into
+`~/.cache/augur/models/`:
 
 | Model                    | Size    | Purpose                                       |
 | ------------------------ | ------- | --------------------------------------------- |
@@ -106,7 +106,7 @@ VERIFY downloads model weights on first use into
 
 Whichlang (the default classifier) ships embedded — no download.
 
-Tooling that VERIFY shells out to:
+Tooling that AUGUR shells out to:
 
 | Tool        | Required for                              | Install                                       |
 | ----------- | ----------------------------------------- | --------------------------------------------- |
@@ -116,9 +116,9 @@ Tooling that VERIFY shells out to:
 | `python3` + transformers + sentencepiece + ctranslate2 | NLLB translation | `pip3 install --user transformers torch sentencepiece ctranslate2` |
 | `pyannote.audio` | Speaker diarization (`--diarize`)    | `pip3 install --user pyannote.audio`          |
 | `yara`      | YARA pattern scanning (`--yara-rules`)    | `brew install yara` / `apt install yara`      |
-| MaxMind `GeoLite2-City.mmdb` | IP geolocation         | manual download — see `verify geoip --setup`  |
+| MaxMind `GeoLite2-City.mmdb` | IP geolocation         | manual download — see `augur geoip --setup`  |
 
-`verify self-test` reports the status of each.
+`augur self-test` reports the status of each.
 
 ---
 
@@ -128,14 +128,14 @@ Classified workstations that cannot reach the internet should
 follow [`AIRGAP_INSTALL.md`](AIRGAP_INSTALL.md). The short
 version: one machine builds a tarball with all model weights,
 USB-transfers it, and the destination machine runs
-`install.sh`. `VERIFY_AIRGAP_PATH` shortcuts the LID model
+`install.sh`. `AUGUR_AIRGAP_PATH` shortcuts the LID model
 fetch when set.
 
 ---
 
 ## Language support
 
-VERIFY's translation layer (NLLB-200-distilled-600M) supports
+AUGUR's translation layer (NLLB-200-distilled-600M) supports
 all 200 languages NLLB ships. The classifier coverage depends
 on backend:
 
@@ -170,12 +170,12 @@ guidance on confidence tiers.
 
 ## Machine translation advisory
 
-> **All translations produced by VERIFY are machine-generated.**
+> **All translations produced by AUGUR are machine-generated.**
 > They have NOT been reviewed by a certified human translator.
 > For legal proceedings, verify all translations with a
 > qualified human linguist.
 
-This appears on every output surface VERIFY produces. It is
+This appears on every output surface AUGUR produces. It is
 not suppressible by any flag. Speaker labels (when `--diarize`
 is used) carry an additional advisory: automated voice
 segmentation is NOT biometric identification.

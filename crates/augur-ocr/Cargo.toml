@@ -1,0 +1,13 @@
+[package]
+name = "augur-ocr"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Tesseract OCR for images (stub in Sprint 1)."
+
+[dependencies]
+augur-core = { path = "../augur-core" }
+log = { workspace = true }
+thiserror = { workspace = true }
+pdf-extract = "0.10.0"

@@ -1,7 +1,7 @@
-# VERIFY — Known Language Detection Limitations
+# AUGUR — Known Language Detection Limitations
 
 This document enumerates language-pair confusions and other
-classifier limitations VERIFY ships with. None of these are bugs;
+classifier limitations AUGUR ships with. None of these are bugs;
 they are inherent to the underlying open-source models. The
 intent of this document is to make sure examiners working high-
 stakes cases know when to bring a human linguist into the loop.
@@ -21,16 +21,16 @@ specifically optimized for the Pashto/Persian distinction. The
 Sprint 5 P1 probe confirmed this: a clearly Pashto sentence
 classifies as `fa` with confidence ≈ 0.76.
 
-**Behavior:** VERIFY may classify Pashto text as `fa`. The
+**Behavior:** AUGUR may classify Pashto text as `fa`. The
 confidence score does NOT reliably distinguish "really Persian"
 from "Pashto misclassified as Persian"; both routinely sit in
 the 0.7 – 0.95 band.
 
-**Mitigation in VERIFY:**
+**Mitigation in AUGUR:**
 1. When the source language is detected as `fa`, the translation
    pipeline appends a disambiguation note to the
    `TranslationResult.advisory_notice` (see
-   `crates/verify-translate/src/lib.rs`). The mandatory
+   `crates/augur-translate/src/lib.rs`). The mandatory
    machine-translation advisory is preserved alongside.
 2. The confidence-tier system (Sprint 6 P2) flags inputs under
    10 words as `LOW` with a "verify with a human linguist"
@@ -43,8 +43,8 @@ communications), always verify with a certified human linguist
 who reads both languages fluently. Do NOT rely on confidence
 score alone.
 
-**Sprint reference:** VERIFY Sprint 5 (2026-04-25) confirmed via
-`crates/verify-classifier/examples/lid_pure_probe.rs`. Sprint 6
+**Sprint reference:** AUGUR Sprint 5 (2026-04-25) confirmed via
+`crates/augur-classifier/examples/lid_pure_probe.rs`. Sprint 6
 (2026-04-26) wired the disambiguation advisory.
 
 ## Short-Text Classification
@@ -53,7 +53,7 @@ score alone.
 **Severity:** Medium — affects all language pairs equally.
 **Behavior:** Every LID model degrades on very short inputs.
 Whichlang in particular reports `1.0` on inputs as small as one
-word, which is misleading. VERIFY's Sprint 6 P2 confidence-tier
+word, which is misleading. AUGUR's Sprint 6 P2 confidence-tier
 system surfaces a `LOW` tier with a "Short input (N words) —
 language detection may be unreliable" advisory whenever the
 input is below `SHORT_INPUT_WORD_COUNT = 10`, regardless of the
@@ -62,7 +62,7 @@ raw model score.
 ## Other Forensically Important Language Pairs
 
 The following pairs are also commonly confused by automated
-language identification. VERIFY does not surface specific
+language identification. AUGUR does not surface specific
 advisories for these today (Sprint 7+ candidates), but examiners
 working in these contexts should treat any single-pair
 classification as advisory:
@@ -81,7 +81,7 @@ classification as definitive.
 
 ## Reading the Confidence Tier
 
-VERIFY emits `HIGH`, `MEDIUM`, or `LOW` for every classification
+AUGUR emits `HIGH`, `MEDIUM`, or `LOW` for every classification
 (Sprint 6 P2):
 
 | Tier | Score | Word count | Examiner action |
@@ -94,9 +94,9 @@ The tier is encoded in the batch JSON / CSV per file
 (`confidence_tier`) and printed alongside every classify /
 translate output line.
 
-## What VERIFY Does NOT Decide For You
+## What AUGUR Does NOT Decide For You
 
-VERIFY surfaces the model's best guess plus the right caveats —
+AUGUR surfaces the model's best guess plus the right caveats —
 it does not decide whether a piece of evidence is admissible,
 whether a translation is accurate enough for court, or whether
 the speaker / writer is who you think they are. Those calls

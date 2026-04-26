@@ -1,9 +1,9 @@
 //! Minimal `strata-fs` stub.
 //!
-//! Vendored alongside `strata-plugin-sdk` so VERIFY's
-//! `--features verify-plugin-sdk/strata` build does NOT pull in
+//! Vendored alongside `strata-plugin-sdk` so AUGUR's
+//! `--features augur-plugin-sdk/strata` build does NOT pull in
 //! the upstream NTFS / APFS / ext4 / EWF / sysinfo parser tree.
-//! VERIFY's Strata plugin does not need any VFS-backed evidence
+//! AUGUR's Strata plugin does not need any VFS-backed evidence
 //! containers — it walks `PluginContext::root_path` directly via
 //! `std::fs::read_dir` — but the upstream SDK re-exports the
 //! `VirtualFilesystem` trait at its public boundary (and uses it
@@ -22,7 +22,7 @@ pub mod vfs {
     pub type VfsResult<T> = Result<T, VfsError>;
 
     /// Minimal error enum. The stub never produces these in
-    /// practice (VERIFY's plugin never instantiates a VFS); a
+    /// practice (AUGUR's plugin never instantiates a VFS); a
     /// hypothetical caller that *does* mount one is responsible
     /// for plugging in a real `strata-fs` build.
     #[derive(Debug)]

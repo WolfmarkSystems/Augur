@@ -1,7 +1,7 @@
-# VERIFY benchmark fixtures
+# AUGUR benchmark fixtures
 
 Super Sprint Group C P5. Hand-curated short corpora used by
-`verify benchmark` to time classification and translation
+`augur benchmark` to time classification and translation
 pipelines.
 
 | File                  | Language     | Words | Notes                              |

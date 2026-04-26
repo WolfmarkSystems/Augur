@@ -3,11 +3,11 @@ name = "strata-plugin-sdk"
 version = "0.1.0-vendored"
 edition = "2021"
 license = "Proprietary"
-description = "Vendored copy of upstream strata-plugin-sdk @ ~/Wolfmark/strata/crates/strata-plugin-sdk. VERIFY Sprint 8 P1 vendored this so `cargo build --features verify-plugin-sdk/strata` works without the sibling Strata workspace."
+description = "Vendored copy of upstream strata-plugin-sdk @ ~/Wolfmark/strata/crates/strata-plugin-sdk. AUGUR Sprint 8 P1 vendored this so `cargo build --features augur-plugin-sdk/strata` works without the sibling Strata workspace."
 
 # NOTE: dev-dependencies (tempfile) intentionally elided from the
 # upstream — they only fire when running the SDK's own test suite,
-# which we do not run from VERIFY. The vendored SDK is consumed
+# which we do not run from AUGUR. The vendored SDK is consumed
 # at the type-system level only.
 
 [dependencies]

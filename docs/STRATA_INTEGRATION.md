@@ -1,12 +1,12 @@
-# VERIFY — Strata Plugin Integration
+# AUGUR — Strata Plugin Integration
 
-How to wire VERIFY into the Strata plugin grid as a first-class
+How to wire AUGUR into the Strata plugin grid as a first-class
 analyzer that surfaces foreign-language translations alongside
 the Strata-native forensic plugins.
 
-## What VERIFY contributes
+## What AUGUR contributes
 
-VERIFY classifies foreign-language content in evidence and
+AUGUR classifies foreign-language content in evidence and
 emits **machine-translated** artifacts that surface in Strata's
 Communications panel. Every artifact is advisory — Strata's UI
 surfaces the same `[MT — review by certified human translator]`
@@ -15,42 +15,42 @@ export paths.
 
 ## Build
 
-VERIFY's Strata trait impl is feature-gated so the default
+AUGUR's Strata trait impl is feature-gated so the default
 build stays small. To produce a Strata-compatible build:
 
 ```bash
-cargo build --features verify-plugin-sdk/strata --release
+cargo build --features augur-plugin-sdk/strata --release
 ```
 
 The vendored Strata SDK lives at
 `vendor/strata-plugin-sdk/`; a minimal `vendor/strata-fs/` stub
 satisfies the upstream SDK's `VirtualFilesystem` re-export so
 the analyzer compiles without pulling in NTFS/APFS/ext4/EWF
-parsers VERIFY does not need.
+parsers AUGUR does not need.
 
 ## Wiring into Strata's runtime
 
-1. Add VERIFY's plugin SDK to Strata's `Cargo.toml`:
+1. Add AUGUR's plugin SDK to Strata's `Cargo.toml`:
    ```toml
-   verify-plugin-sdk = {
-       path = "../verify/crates/verify-plugin-sdk",
+   augur-plugin-sdk = {
+       path = "../verify/crates/augur-plugin-sdk",
        features = ["strata"],
    }
    ```
 
-2. Register VERIFY in Strata's plugin grid (`PLUGIN_NAMES`):
+2. Register AUGUR in Strata's plugin grid (`PLUGIN_NAMES`):
    ```rust
    pub const PLUGIN_NAMES: &[&str] = &[
        // existing entries...
-       "VERIFY",
+       "AUGUR",
    ];
    ```
 
-3. Surface VERIFY's metadata in the Strata UI
+3. Surface AUGUR's metadata in the Strata UI
    (`types/index.ts`):
    ```typescript
    {
-     name: "VERIFY",
+     name: "AUGUR",
      version: "1.0.0",
      category: "Analyzer",
      description: "Foreign language detection and translation",
@@ -59,21 +59,21 @@ parsers VERIFY does not need.
 
 4. Wire the dispatch in `run_plugin`:
    ```rust
-   "VERIFY" => {
-       let plugin = verify_plugin_sdk::VerifyStrataPlugin::new();
+   "AUGUR" => {
+       let plugin = augur_plugin_sdk::AugurStrataPlugin::new();
        plugin.execute(context)
    }
    ```
 
 ## Artifact shape
 
-Every translation artifact emitted by VERIFY:
+Every translation artifact emitted by AUGUR:
 
 | field          | value                                                              |
 | -------------- | ------------------------------------------------------------------ |
 | `category`     | `ArtifactCategory::Communications`                                 |
 | `subcategory`  | `"Foreign Language Translation"`                                   |
-| `title`        | `[MT — review by a certified human translator] VERIFY Translation: <file>` |
+| `title`        | `[MT — review by a certified human translator] AUGUR Translation: <file>` |
 | `detail`       | The translated text                                                |
 | `forensic_value` | `ForensicValue::High`                                            |
 | `confidence`   | `50` (Medium — MT output)                                          |
@@ -95,20 +95,20 @@ unlabeled translation.
 ## Testing the integration
 
 The default-build test suite covers the adapter shape via
-unit tests under `crates/verify-plugin-sdk/src/strata_impl.rs`.
+unit tests under `crates/augur-plugin-sdk/src/strata_impl.rs`.
 A live integration test walks a temp evidence directory and
 asserts the advisory invariant holds:
 
 ```bash
-VERIFY_RUN_INTEGRATION_TESTS=1 cargo test \
-    --features verify-plugin-sdk/strata \
+AUGUR_RUN_INTEGRATION_TESTS=1 cargo test \
+    --features augur-plugin-sdk/strata \
     -- --include-ignored strata_plugin_processes_real_arabic_evidence
 ```
 
 For metadata sanity:
 
 ```bash
-cargo test --features verify-plugin-sdk/strata \
+cargo test --features augur-plugin-sdk/strata \
     strata_plugin_metadata_complete
 ```
 
@@ -122,4 +122,4 @@ cargo test --features verify-plugin-sdk/strata \
   audio inputs produce flat translations only.
 - Subtitle (`.srt` / `.vtt`) inputs are skipped by the Strata
   walker; analysts who want subtitle translations should run
-  `verify translate --output-srt` directly.
+  `augur translate --output-srt` directly.

@@ -1,7 +1,7 @@
 """Sprint 4 P4 — ctranslate2 vs transformers benchmark.
 
 Driven by the same JSON-over-stdio worker scripts the production
-verify-translate engine uses, so the numbers reflect what
+augur-translate engine uses, so the numbers reflect what
 forensic users will actually see.
 
 Usage:
@@ -19,11 +19,11 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent.parent
-SCRIPT_TF = ROOT / "crates" / "verify-translate" / "src" / "script.py"
-SCRIPT_CT2 = ROOT / "crates" / "verify-translate" / "src" / "script_ct2.py"
+SCRIPT_TF = ROOT / "crates" / "augur-translate" / "src" / "script.py"
+SCRIPT_CT2 = ROOT / "crates" / "augur-translate" / "src" / "script_ct2.py"
 HF_CACHE = Path.home() / ".cache" / "verify" / "models" / "nllb"
 CT2_DIR = HF_CACHE / "ct2"
-ENV = {**os.environ, "VERIFY_HF_CACHE": str(HF_CACHE)}
+ENV = {**os.environ, "AUGUR_HF_CACHE": str(HF_CACHE)}
 
 
 def time_call(label: str, script: Path, request: dict) -> tuple[float, str]:

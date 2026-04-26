@@ -1,9 +1,9 @@
-# VERIFY
+# AUGUR
 
 **Offline-first forensic translation and transcription tool.**
 For law enforcement and intelligence analysts.
 
-VERIFY surfaces foreign-language content inside digital
+AUGUR surfaces foreign-language content inside digital
 evidence — text, audio, video, image, PDF, subtitle — and
 translates it into the examiner's working language. **No
 evidence ever leaves your machine.**
@@ -31,23 +31,23 @@ evidence ever leaves your machine.**
 
 ```bash
 # Translate a single audio file
-verify translate --input recording.mp3 --target en
+augur translate --input recording.mp3 --target en
 
 # Walk an evidence directory and emit an HTML report
-verify batch --input /evidence --target en \
+augur batch --input /evidence --target en \
     --format html --output report.html --threads 4
 
 # Bundle the run into a shareable evidence package
-verify package --input /evidence --output case-001.zip
+augur package --input /evidence --output case-001.zip
 ```
 
 ## Install
 
 ```bash
-git clone <verify repo> verify && cd verify
+git clone <augur repo> augur && cd augur
 cargo build --release
-sudo install target/release/verify /usr/local/bin/verify
-verify self-test --full   # downloads models on first use
+sudo install target/release/augur /usr/local/bin/augur
+augur self-test --full   # downloads models on first use
 ```
 
 For air-gapped workstations: see
@@ -55,7 +55,7 @@ For air-gapped workstations: see
 
 ## Forensic discipline
 
-Every translation VERIFY produces is labeled machine-generated.
+Every translation AUGUR produces is labeled machine-generated.
 The advisory fires on every output surface — console, batch
 JSON / CSV / HTML, evidence manifest, Strata plugin artifact —
 and is not suppressible by any flag.
@@ -74,10 +74,10 @@ certified human translator.**
 - [`docs/AIRGAP_INSTALL.md`](docs/AIRGAP_INSTALL.md) — offline
   install for classified environments.
 - [`docs/STRATA_INTEGRATION.md`](docs/STRATA_INTEGRATION.md) —
-  building VERIFY as a Strata plugin.
+  building AUGUR as a Strata plugin.
 - [`docs/LANGUAGE_LIMITATIONS.md`](docs/LANGUAGE_LIMITATIONS.md) —
   known classifier ambiguities (Pashto/Persian, Hindi/Urdu,
-  short-text reliability) and how VERIFY surfaces them.
+  short-text reliability) and how AUGUR surfaces them.
 - [`CLAUDE.md`](CLAUDE.md) — engineering invariants + sprint
   decisions for developers.
 

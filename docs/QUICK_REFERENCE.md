@@ -1,45 +1,45 @@
-# VERIFY Quick Reference
+# AUGUR Quick Reference
 
 ## Most common commands
 
 ```bash
 # Verify the install
-verify self-test
+augur self-test
 
 # Single-file translation
-verify translate --input <file>      --target en
-verify translate --image <pic>       --target en --ocr-lang ar
-verify translate --input <subs.srt>  --target en --output-srt out.srt
+augur translate --input <file>      --target en
+augur translate --image <pic>       --target en --ocr-lang ar
+augur translate --input <subs.srt>  --target en --output-srt out.srt
 
 # Directory of evidence
-verify batch --input <dir> --target en --output report.json
-verify batch --input <dir> --target en --format html --output report.html
-verify batch --input <dir> --target en --threads 4
+augur batch --input <dir> --target en --output report.json
+augur batch --input <dir> --target en --format html --output report.html
+augur batch --input <dir> --target en --threads 4
 
 # Evidence package for sharing
-verify package --input <dir> --output case-001.zip
+augur package --input <dir> --output case-001.zip
 
 # Forensic utilities
-verify timestamp 1762276748
-verify geoip 8.8.8.8
+augur timestamp 1762276748
+augur geoip 8.8.8.8
 ```
 
 ## Cache layout
 
 | Path                                         | Contents                       |
 | -------------------------------------------- | ------------------------------ |
-| `~/.cache/verify/models/lid.176.ftz`         | fastText LID model (optional)  |
-| `~/.cache/verify/models/whisper/hf/`         | Whisper safetensors            |
-| `~/.cache/verify/models/nllb/`               | NLLB-200 weights (HF cache)    |
-| `~/.cache/verify/models/nllb/ct2/`           | ctranslate2 converted model    |
-| `~/.cache/verify/models/pyannote/`           | pyannote diarization weights   |
-| `~/.cache/verify/hf_token`                   | Hugging Face token (chmod 600) |
-| `~/.cache/verify/GeoLite2-City.mmdb`         | MaxMind GeoIP DB (manual)      |
+| `~/.cache/augur/models/lid.176.ftz`         | fastText LID model (optional)  |
+| `~/.cache/augur/models/whisper/hf/`         | Whisper safetensors            |
+| `~/.cache/augur/models/nllb/`               | NLLB-200 weights (HF cache)    |
+| `~/.cache/augur/models/nllb/ct2/`           | ctranslate2 converted model    |
+| `~/.cache/augur/models/pyannote/`           | pyannote diarization weights   |
+| `~/.cache/augur/hf_token`                   | Hugging Face token (chmod 600) |
+| `~/.cache/augur/GeoLite2-City.mmdb`         | MaxMind GeoIP DB (manual)      |
 
 ## Air-gap override
 
 ```bash
-export VERIFY_AIRGAP_PATH=/path/to/staged/models
+export AUGUR_AIRGAP_PATH=/path/to/staged/models
 ```
 
 Bypasses the LID download. Whisper / NLLB / pyannote use the
@@ -63,7 +63,7 @@ HF cache layout — see `AIRGAP_INSTALL.md`.
 
 | Question                              | File                                |
 | ------------------------------------- | ----------------------------------- |
-| What does VERIFY do, full picture?    | `docs/USER_MANUAL.md`               |
+| What does AUGUR do, full picture?    | `docs/USER_MANUAL.md`               |
 | Air-gap install on offline workstation | `docs/AIRGAP_INSTALL.md`            |
 | Strata plugin integration             | `docs/STRATA_INTEGRATION.md`        |
 | Language pair confusion / limits      | `docs/LANGUAGE_LIMITATIONS.md`      |

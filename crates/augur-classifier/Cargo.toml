@@ -1,0 +1,39 @@
+[package]
+name = "augur-classifier"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Language identification router. whichlang = production; fasttext = experimental, see Sprint 4."
+
+[dependencies]
+augur-core = { path = "../augur-core" }
+log = { workspace = true }
+thiserror = { workspace = true }
+# Sprint 5 P1: `fasttext-pure-rs` is binary-compatible with
+# Meta's `lid.176.ftz` (Arabic / Chinese / Russian / Spanish /
+# Persian / Urdu all classify correctly). It REPLACES the
+# broken `fasttext = 0.8.0` crate that Sprints 1-4 carried.
+# `whichlang` remains the production default (16 major languages,
+# embedded weights, no network); fasttext-pure-rs is opt-in via
+# `--classifier-backend fasttext` for 176-language coverage on
+# workstations that can fetch the LID model once.
+fasttext-pure-rs = "0.1.0"
+whichlang = "0.1.1"
+serde = { version = "1.0.228", features = ["derive"] }
+
+[[example]]
+name = "lid_pure_probe"
+# Sprint 5 P1 — confirms `fasttext-pure-rs` reads `lid.176.ftz`
+# correctly. Reproduce:
+#   cargo run -p augur-classifier --features fasttext-probe \
+#     --example lid_pure_probe
+required-features = ["fasttext-probe"]
+
+[features]
+default = []
+# Enables the `lid_label_probe` example. The dependency on the
+# `fasttext` crate is unconditional today; the feature exists so a
+# future `fasttext-pure-rs` evaluation can swap implementations
+# without touching downstream callers.
+fasttext-probe = []
