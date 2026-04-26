@@ -88,6 +88,100 @@ impl Manifest {
 
 /// Render the chain-of-custody plaintext block from a finalised
 /// batch report + report config + system metadata.
+/// Sprint 17 P2 — human-readable summary of the examiner-flagged
+/// segments. Lands at `review/REVIEW_REQUIRED.txt` in the
+/// package. Always closes with the MT advisory in prose.
+pub fn render_review_required_txt(
+    flags: &[serde_json::Value],
+    report: &BatchResult,
+) -> String {
+    let mut out = String::new();
+    out.push_str("AUGUR Evidence Package — Human Review Required\n");
+    out.push_str("===============================================\n");
+    out.push_str(&format!(
+        "{} segment{} have been flagged by the examiner for human review.\n\n",
+        flags.len(),
+        if flags.len() == 1 { "" } else { "s" }
+    ));
+    out.push_str(
+        "This package contains machine translations (NLLB-200, Meta AI; \
+         SeamlessM4T, Meta AI; CAMeL Tools, Carnegie Mellon Univ.). \
+         The flagged segments below require verification by a certified \
+         human linguist before use in legal proceedings.\n\n",
+    );
+    let pick_str = |obj: &serde_json::Value, a: &str, b: &str| -> String {
+        obj.get(a)
+            .and_then(|v| v.as_str())
+            .or_else(|| obj.get(b).and_then(|v| v.as_str()))
+            .unwrap_or("")
+            .to_string()
+    };
+    let pick_u64 = |obj: &serde_json::Value, a: &str, b: &str| -> u64 {
+        obj.get(a)
+            .and_then(|v| v.as_u64())
+            .or_else(|| obj.get(b).and_then(|v| v.as_u64()))
+            .unwrap_or(0)
+    };
+    for flag in flags {
+        let idx = pick_u64(flag, "segmentIndex", "segment_index");
+        let path = pick_str(flag, "filePath", "file_path");
+        let note = pick_str(flag, "examinerNote", "examiner_note");
+        let status = if flag.get("reviewStatus").is_some() {
+            pick_str(flag, "reviewStatus", "reviewStatus")
+        } else {
+            pick_str(flag, "review_status", "review_status")
+        };
+        // Try to find the segment text in the report.
+        let mut original = String::new();
+        let mut translation = String::new();
+        for r in &report.results {
+            if !path.is_empty() && r.file_path != path {
+                continue;
+            }
+            if let Some(segs) = &r.segments {
+                // BatchSegment has no public index field; use
+                // position to match the flag's segmentIndex.
+                if let Some(s) = segs.get(idx as usize) {
+                    original = s.source_text.clone();
+                    translation = s.translated_text.clone();
+                    break;
+                }
+            }
+            if r.file_path == path
+                || (path.is_empty() && original.is_empty() && r.translated_text.is_some())
+            {
+                if let Some(t) = &r.translated_text {
+                    translation = t.clone();
+                }
+                if let Some(o) = &r.source_text {
+                    original = o.clone();
+                }
+            }
+        }
+        out.push_str(&format!(
+            "Segment {} (file: {}):\n  Original: {original}\n  MT Translation: {translation}\n",
+            idx + 1,
+            if path.is_empty() { "(unknown)" } else { &path }
+        ));
+        if !note.is_empty() {
+            out.push_str(&format!("  Examiner note: {note}\n"));
+        }
+        let status_s = if status.is_empty() { "needs_review" } else { &status };
+        out.push_str(&format!(
+            "  Status: {}\n\n",
+            status_s.replace('_', " ").to_uppercase()
+        ));
+    }
+    out.push_str("MACHINE TRANSLATION NOTICE:\n");
+    out.push_str(
+        "All translations in this package are machine-generated and have \
+         not been reviewed by a certified human translator. Flagged segments \
+         are of particular concern. Verify ALL translations before use in \
+         legal proceedings.\n",
+    );
+    out
+}
+
 pub fn render_chain_of_custody(
     report: &BatchResult,
     config: &ReportConfig,
@@ -303,6 +397,65 @@ pub fn write_package(
                 &bytes,
                 opts,
             )?;
+        }
+    }
+
+    // Sprint 17 P2 — examiner-flagged segments, sourced from
+    // the optional AUGUR_FLAGS_JSON env var. The schema accepts
+    // both the desktop GUI's camelCase shape and the snake_case
+    // shape used elsewhere; either round-trips into the
+    // REVIEW_REQUIRED.txt summary and the structured JSON.
+    if let Some(flags_path) = std::env::var_os("AUGUR_FLAGS_JSON") {
+        let flags_path = std::path::PathBuf::from(flags_path);
+        if flags_path.exists() {
+            match std::fs::read(&flags_path) {
+                Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
+                    Ok(parsed) => {
+                        let flags_arr: Vec<serde_json::Value> = parsed
+                            .get("flags")
+                            .and_then(|v| v.as_array())
+                            .cloned()
+                            .unwrap_or_default();
+                        if !flags_arr.is_empty() {
+                            let txt = render_review_required_txt(&flags_arr, report);
+                            write_zip_entry(
+                                &mut zip,
+                                "review/REVIEW_REQUIRED.txt",
+                                txt.as_bytes(),
+                                opts,
+                            )?;
+                            let body = serde_json::to_string_pretty(
+                                &serde_json::json!({
+                                    "machine_translation_notice": MACHINE_TRANSLATION_NOTICE,
+                                    "case_number": config
+                                        .case_number
+                                        .clone()
+                                        .unwrap_or_default(),
+                                    "flagged_segments_count": flags_arr.len(),
+                                    "flagged_segments": flags_arr,
+                                }),
+                            )
+                            .map_err(|e| {
+                                AugurError::Translate(format!(
+                                    "review/flagged_segments.json serialize: {e}"
+                                ))
+                            })?;
+                            write_zip_entry(
+                                &mut zip,
+                                "review/flagged_segments.json",
+                                body.as_bytes(),
+                                opts,
+                            )?;
+                        }
+                    }
+                    Err(e) => log::warn!(
+                        "AUGUR_FLAGS_JSON pointed at unparseable JSON ({e}); review/ skipped"
+                    ),
+                },
+                Err(e) => log::warn!(
+                    "AUGUR_FLAGS_JSON could not be read ({e}); review/ skipped"
+                ),
+            }
         }
     }
 

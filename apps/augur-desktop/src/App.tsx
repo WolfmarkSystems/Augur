@@ -9,6 +9,7 @@ import WorkspaceAudio from "./components/WorkspaceAudio";
 import WorkspaceBatch from "./components/WorkspaceBatch";
 import ModelManager from "./components/ModelManager";
 import PackageWizard from "./components/PackageWizard";
+import ReviewPanel from "./components/ReviewPanel";
 import ErrorBanner, { type ErrorBannerType } from "./components/ErrorBanner";
 import { invoke } from "@tauri-apps/api/core";
 import {
@@ -16,6 +17,8 @@ import {
   augurBinaryPath,
   checkAugurAvailable,
   getCaseState,
+  getSegmentFlags,
+  saveSegmentFlags,
   setCaseInfo,
   mtAdvisoryText,
   onBatchComplete,
@@ -70,6 +73,8 @@ export default function App() {
   const setExaminerStore = useAppStore((s) => s.setExaminerName);
   const setAgencyStore = useAppStore((s) => s.setAgency);
   const setRecentFiles = useAppStore((s) => s.setRecentFiles);
+  const flaggedSegments = useAppStore((s) => s.flaggedSegments);
+  const hydrateFlags = useAppStore((s) => s.hydrateFlags);
 
   // Subscribe to pipeline events once on mount.
   useEffect(() => {
@@ -220,6 +225,37 @@ export default function App() {
     });
   }, [caseNumber, examinerName, agency]);
 
+  // Sprint 17 P1 — restore flags whenever the loaded file
+  // changes; persist whenever the flag map changes.
+  useEffect(() => {
+    if (!loadedFile) return;
+    getSegmentFlags({ filePath: loadedFile })
+      .then((raw) => {
+        const flags = (raw as Array<Record<string, unknown>>).map((r) => ({
+          segmentIndex: Number(r.segmentIndex ?? r.segment_index ?? 0),
+          flaggedAt: String(r.flaggedAt ?? r.flagged_at ?? ""),
+          examinerNote: String(r.examinerNote ?? r.examiner_note ?? ""),
+          reviewStatus: (r.reviewStatus ?? r.review_status ?? "needs_review") as
+            | "needs_review"
+            | "reviewed"
+            | "disputed",
+        }));
+        hydrateFlags(flags);
+      })
+      .catch(() => hydrateFlags([]));
+  }, [loadedFile, hydrateFlags]);
+
+  useEffect(() => {
+    if (!loadedFile) return;
+    const flags = Object.values(flaggedSegments).map((f) => ({
+      segmentIndex: f.segmentIndex,
+      flaggedAt: f.flaggedAt,
+      examinerNote: f.examinerNote,
+      reviewStatus: f.reviewStatus,
+    }));
+    saveSegmentFlags({ filePath: loadedFile, flags }).catch(() => {});
+  }, [loadedFile, flaggedSegments]);
+
   // Whenever a new file is loaded, kick off translation +
   // record it in the persistent recent-files list.
   useEffect(() => {
@@ -322,6 +358,7 @@ export default function App() {
         ) : (
           <WorkspaceDoc />
         )}
+        <ReviewPanel />
       </main>
       {augurAvailable === false && bannerType !== "cli-not-found" && (
         <div className="cli-banner" role="alert">

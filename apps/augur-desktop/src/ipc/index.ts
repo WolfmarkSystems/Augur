@@ -34,6 +34,7 @@ export async function createEvidencePackage(args: {
   examinerName: string;
   agency: string;
   outputPath: string;
+  flaggedSegments?: unknown[];
 }): Promise<string> {
   return invoke<string>("create_evidence_package", args);
 }
@@ -173,6 +174,7 @@ export async function exportReport(args: {
   targetLang: string;
   dialect: string | null;
   segments: unknown[];
+  flaggedSegments?: unknown[];
 }): Promise<string> {
   return invoke<string>("export_report", args);
 }

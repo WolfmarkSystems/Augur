@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { useAppStore } from "../store/appStore";
 import { isRtl } from "./languages";
 import CodeSwitchBand from "./CodeSwitchBand";
@@ -8,8 +9,14 @@ export default function TranslationPanel() {
   const codeSwitches = useAppStore((s) => s.codeSwitches);
   const showBands = useAppStore((s) => s.showCodeSwitchBands);
   const isTranslating = useAppStore((s) => s.isTranslating);
+  const flaggedSegments = useAppStore((s) => s.flaggedSegments);
+  const flagSegment = useAppStore((s) => s.flagSegment);
+  const unflagSegment = useAppStore((s) => s.unflagSegment);
+  const [openPopover, setOpenPopover] = useState<number | null>(null);
+  const [draftNote, setDraftNote] = useState<string>("");
 
   const dir = isRtl(targetLang.code) ? "rtl" : "ltr";
+  const flaggedCount = Object.keys(flaggedSegments).length;
 
   return (
     <section className="panel panel-translation">
@@ -23,6 +30,11 @@ export default function TranslationPanel() {
             <span className="live-dot" /> live
           </span>
         )}
+        {flaggedCount > 0 && (
+          <span className="panel-pill panel-pill-danger">
+            {flaggedCount} flagged
+          </span>
+        )}
       </header>
       <div className="panel-page" dir={dir}>
         {segments.length === 0 ? (
@@ -32,10 +44,14 @@ export default function TranslationPanel() {
         ) : (
           segments.map((seg, i) => {
             const csHere =
-              showBands &&
-              codeSwitches.find((c) => c.offset === seg.index);
+              showBands && codeSwitches.find((c) => c.offset === seg.index);
+            const flag = flaggedSegments[seg.index];
+            const isOpen = openPopover === seg.index;
             return (
-              <div key={seg.index} className="panel-row">
+              <div
+                key={seg.index}
+                className={`panel-row segment-row ${flag ? "is-flagged" : ""}`}
+              >
                 {csHere && (
                   <CodeSwitchBand
                     from={csHere.from}
@@ -43,12 +59,66 @@ export default function TranslationPanel() {
                     offset={csHere.offset}
                   />
                 )}
-                <p className="panel-text panel-text-translated">
-                  {seg.translatedText}
-                  {!seg.isComplete && i === segments.length - 1 && (
-                    <span className="live-cursor" aria-hidden="true" />
-                  )}
-                </p>
+                <div className="segment-row-body">
+                  <p className="panel-text panel-text-translated">
+                    {seg.translatedText}
+                    {!seg.isComplete && i === segments.length - 1 && (
+                      <span className="live-cursor" aria-hidden="true" />
+                    )}
+                  </p>
+                  <button
+                    type="button"
+                    className={`flag-btn ${flag ? "is-active" : ""}`}
+                    onClick={() => {
+                      if (flag) {
+                        unflagSegment(seg.index);
+                        setOpenPopover(null);
+                      } else {
+                        setDraftNote("");
+                        setOpenPopover(isOpen ? null : seg.index);
+                      }
+                    }}
+                    title={flag ? "Unflag (currently flagged for review)" : "Flag for human review"}
+                    aria-pressed={!!flag}
+                  >
+                    ⚑
+                  </button>
+                </div>
+                {flag && flag.examinerNote && (
+                  <div className="flag-note" title="Examiner note">
+                    <strong>Note:</strong> {flag.examinerNote}
+                  </div>
+                )}
+                {isOpen && !flag && (
+                  <div className="flag-popover">
+                    <textarea
+                      autoFocus
+                      placeholder="Note for reviewer (optional)…"
+                      value={draftNote}
+                      onChange={(e) => setDraftNote(e.target.value)}
+                      rows={3}
+                    />
+                    <div className="flag-popover-actions">
+                      <button
+                        type="button"
+                        className="btn"
+                        onClick={() => setOpenPopover(null)}
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        type="button"
+                        className="btn btn-primary"
+                        onClick={() => {
+                          flagSegment(seg.index, draftNote.trim());
+                          setOpenPopover(null);
+                        }}
+                      >
+                        Flag for Review
+                      </button>
+                    </div>
+                  </div>
+                )}
               </div>
             );
           })

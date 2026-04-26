@@ -63,6 +63,7 @@ export default function MenuBar({
   const targetLang = useAppStore((s) => s.targetLang);
   const recentFiles = useAppStore((s) => s.recentFiles);
   const loadFile = useAppStore((s) => s.loadFile);
+  const flaggedSegments = useAppStore((s) => s.flaggedSegments);
 
   const handleOpen = async () => {
     setOpen(null);
@@ -111,6 +112,12 @@ export default function MenuBar({
         translatedText: s.translatedText,
         speakerId: s.speakerId ?? null,
       }));
+      const flagsPayload = Object.values(flaggedSegments).map((f) => ({
+        segmentIndex: f.segmentIndex,
+        flaggedAt: f.flaggedAt,
+        examinerNote: f.examinerNote,
+        reviewStatus: f.reviewStatus,
+      }));
       await exportReport({
         format,
         outputPath: out,
@@ -119,6 +126,7 @@ export default function MenuBar({
         targetLang: targetLang.code,
         dialect: dialect ? dialect.dialect : null,
         segments: segPayload,
+        flaggedSegments: flagsPayload,
       });
     } catch (err) {
       setError(`Export failed: ${String(err)}`);

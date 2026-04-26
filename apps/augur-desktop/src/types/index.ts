@@ -58,6 +58,15 @@ export interface BatchFileRow {
   status: BatchFileStatus;
 }
 
+export type ReviewStatus = "needs_review" | "reviewed" | "disputed";
+
+export interface SegmentFlag {
+  segmentIndex: number;
+  flaggedAt: string;
+  examinerNote: string;
+  reviewStatus: ReviewStatus;
+}
+
 export interface BatchProgress {
   inputDir: string | null;
   outputPath: string | null;

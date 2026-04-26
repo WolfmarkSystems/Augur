@@ -359,6 +359,18 @@ enum Command {
         /// the desktop GUI can drive a live progress wizard.
         #[arg(long, default_value = "text")]
         format_progress: String,
+
+        /// Sprint 17 P2 — path to a JSON document with the
+        /// examiner-flagged segments to embed in the package's
+        /// `review/` directory. Schema:
+        ///   { "flags": [ { "filePath": "...",
+        ///                  "segmentIndex": 3,
+        ///                  "examinerNote": "...",
+        ///                  "reviewStatus": "needs_review",
+        ///                  "flaggedAt": "ISO8601" }, ... ] }
+        /// Missing or empty file → no review/ directory.
+        #[arg(long)]
+        flags_json: Option<PathBuf>,
     },
 
     /// Convert a forensic timestamp (Unix / Apple / Windows /
@@ -777,6 +789,7 @@ fn run(
             examiner,
             agency,
             format_progress,
+            flags_json,
         } => {
             // Sprint 16 P1 — `--format-progress ndjson` activates
             // the streaming progress channel for the desktop GUI's
@@ -797,6 +810,7 @@ fn run(
                 case_number.as_deref(),
                 examiner.as_deref(),
                 agency.as_deref(),
+                flags_json.as_deref(),
             )
         }
         Command::Geoip { ip, input, setup } => cmd_geoip(ip.as_deref(), input.as_deref(), setup),
@@ -1927,10 +1941,18 @@ fn cmd_package(
     case_number_override: Option<&str>,
     examiner_override: Option<&str>,
     agency_override: Option<&str>,
+    flags_json_path: Option<&std::path::Path>,
 ) -> Result<(), AugurError> {
     use std::sync::atomic::{AtomicU32, Ordering};
     use rayon::prelude::*;
     use augur_core::pipeline::BatchSummary;
+    let _ = flags_json_path; // Pinned in package.rs once threaded fully — currently surfaced via an env hint.
+    if let Some(p) = flags_json_path {
+        // Forward the path via env so package.rs (which already
+        // owns the manifest layout) can pick it up without a
+        // signature change in this sprint.
+        std::env::set_var("AUGUR_FLAGS_JSON", p.as_os_str());
+    }
 
     if !input.exists() || !input.is_dir() {
         return Err(AugurError::InvalidInput(format!(

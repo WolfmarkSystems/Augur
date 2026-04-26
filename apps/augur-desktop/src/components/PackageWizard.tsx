@@ -48,6 +48,8 @@ export default function PackageWizard({ open, onClose }: Props) {
   const setCaseNumber = useAppStore((s) => s.setCaseNumber);
   const setExaminer = useAppStore((s) => s.setExaminerName);
   const setAgency = useAppStore((s) => s.setAgency);
+  const flaggedSegments = useAppStore((s) => s.flaggedSegments);
+  const loadedFile = useAppStore((s) => s.loadedFile);
 
   const [step, setStep] = useState<WizardStep>(1);
   const [inputPath, setInputPath] = useState<string>("");
@@ -157,6 +159,13 @@ export default function PackageWizard({ open, onClose }: Props) {
     }
     setStep(4);
     try {
+      const flagsForPackage = Object.values(flaggedSegments).map((f) => ({
+        filePath: loadedFile ?? inputPath,
+        segmentIndex: f.segmentIndex,
+        examinerNote: f.examinerNote,
+        reviewStatus: f.reviewStatus,
+        flaggedAt: f.flaggedAt,
+      }));
       await createEvidencePackage({
         inputPath,
         targetLang: targetLang.code,
@@ -164,6 +173,7 @@ export default function PackageWizard({ open, onClose }: Props) {
         examinerName,
         agency,
         outputPath,
+        flaggedSegments: flagsForPackage,
       });
     } catch (e) {
       setErrorMsg(`Could not start packaging: ${String(e)}`);

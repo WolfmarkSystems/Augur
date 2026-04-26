@@ -6,6 +6,8 @@ import type {
   DialectInfo,
   FileKind,
   Language,
+  ReviewStatus,
+  SegmentFlag,
   TranslationSegment,
 } from "../types";
 import { ALL_LANGUAGES } from "../components/languages";
@@ -79,6 +81,9 @@ export interface AppState {
     fileType: string;
   }>;
 
+  // Sprint 17 P1 — segment flags for the loaded file
+  flaggedSegments: Record<number, SegmentFlag>;
+
   // View toggles
   showDialectCard: boolean;
   showCodeSwitchBands: boolean;
@@ -119,6 +124,11 @@ export interface AppState {
   setSelfTestFails: (fails: string[]) => void;
   setRecentFiles: (files: AppState["recentFiles"]) => void;
 
+  flagSegment: (index: number, note: string) => void;
+  unflagSegment: (index: number) => void;
+  setReviewStatus: (index: number, status: ReviewStatus) => void;
+  hydrateFlags: (flags: SegmentFlag[]) => void;
+
   toggleDialectCard: () => void;
   toggleCodeSwitchBands: () => void;
   setForceTranscriptView: (v: boolean) => void;
@@ -154,6 +164,7 @@ export const useAppStore = create<AppState>((set) => ({
   augurBinaryPath: null,
   selfTestFails: [],
   recentFiles: [],
+  flaggedSegments: {},
 
   showDialectCard: true,
   showCodeSwitchBands: true,
@@ -177,6 +188,10 @@ export const useAppStore = create<AppState>((set) => ({
       hasCodeSwitching: false,
       overallProgress: 0,
       errorMessage: null,
+      // Sprint 17 P1 — flags are per-file; clear on file change.
+      // Restoration happens in App.tsx via getSegmentFlags() once
+      // the load is acknowledged.
+      flaggedSegments: {},
     }),
   clearFile: () =>
     set({
@@ -292,6 +307,43 @@ export const useAppStore = create<AppState>((set) => ({
     set({ augurAvailable: v, augurBinaryPath: path }),
   setSelfTestFails: (fails) => set({ selfTestFails: fails }),
   setRecentFiles: (files) => set({ recentFiles: files }),
+
+  flagSegment: (index, note) =>
+    set((s) => ({
+      flaggedSegments: {
+        ...s.flaggedSegments,
+        [index]: {
+          segmentIndex: index,
+          flaggedAt: new Date().toISOString(),
+          examinerNote: note,
+          reviewStatus: "needs_review",
+        },
+      },
+    })),
+  unflagSegment: (index) =>
+    set((s) => {
+      const next = { ...s.flaggedSegments };
+      delete next[index];
+      return { flaggedSegments: next };
+    }),
+  setReviewStatus: (index, status) =>
+    set((s) =>
+      s.flaggedSegments[index]
+        ? {
+            flaggedSegments: {
+              ...s.flaggedSegments,
+              [index]: { ...s.flaggedSegments[index], reviewStatus: status },
+            },
+          }
+        : {},
+    ),
+  hydrateFlags: (flags) =>
+    set({
+      flaggedSegments: flags.reduce<Record<number, SegmentFlag>>((acc, f) => {
+        acc[f.segmentIndex] = f;
+        return acc;
+      }, {}),
+    }),
 
   toggleDialectCard: () =>
     set((s) => ({ showDialectCard: !s.showDialectCard })),

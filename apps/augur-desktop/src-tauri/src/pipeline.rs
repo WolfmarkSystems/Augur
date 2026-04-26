@@ -240,12 +240,31 @@ pub async fn create_evidence_package(
     examiner_name: String,
     agency: String,
     output_path: String,
+    flagged_segments: Option<Vec<serde_json::Value>>,
 ) -> Result<String, String> {
     let augur = find_augur_binary()
         .ok_or_else(|| "AUGUR CLI not found.".to_string())?;
     if !PathBuf::from(&input_path).exists() {
         return Err(format!("evidence path does not exist: {input_path}"));
     }
+    // Sprint 17 P2 — when flags are supplied, write them to a
+    // tempfile and pass the path via `--flags-json` so the CLI
+    // can fold them into the package's review/ directory.
+    let flags_path: Option<PathBuf> = flagged_segments
+        .filter(|f| !f.is_empty())
+        .and_then(|flags| {
+            let body = serde_json::to_vec_pretty(&serde_json::json!({
+                "flags": flags,
+            }))
+            .ok()?;
+            let path = std::env::temp_dir().join(format!(
+                "augur-flags-{}-{}.json",
+                std::process::id(),
+                chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+            ));
+            std::fs::write(&path, body).ok()?;
+            Some(path)
+        });
     let mut cmd = Command::new(&augur);
     cmd.arg("package")
         .arg("--input")
@@ -264,6 +283,9 @@ pub async fn create_evidence_package(
     }
     if !agency.is_empty() {
         cmd.arg("--agency").arg(&agency);
+    }
+    if let Some(p) = &flags_path {
+        cmd.arg("--flags-json").arg(p);
     }
     cmd.stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
