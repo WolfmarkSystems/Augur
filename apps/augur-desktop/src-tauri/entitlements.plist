@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Network egress for first-run model downloads (HuggingFace,
+       fastText). Egress is opt-in and audited via the registry's
+       named URL constants. -->
+  <key>com.apple.security.network.client</key>
+  <true/>
+  <!-- Read+write access to user-selected files (evidence the
+       examiner picks via the Tauri file dialog). -->
+  <key>com.apple.security.files.user-selected.read-write</key>
+  <true/>
+  <!-- The installer wizard frequently writes the model bundle
+       under Downloads (DMG transfer) before extraction. -->
+  <key>com.apple.security.files.downloads.read-write</key>
+  <true/>
+  <!-- Models live under ~/Library/Application Support/AUGUR/models/.
+       Sandbox profile would block that path without an absolute-
+       path exception; same exception covers cached weights. -->
+  <key>com.apple.security.temporary-exception.files.absolute-path.read-write</key>
+  <array>
+    <string>/Users/</string>
+  </array>
+</dict>
+</plist>

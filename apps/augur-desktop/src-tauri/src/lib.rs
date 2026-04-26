@@ -11,6 +11,40 @@ pub mod models;
 pub mod pipeline;
 pub mod state;
 
+#[cfg(test)]
+mod tauri_conf_tests {
+    use serde_json::Value;
+
+    const CONF: &str = include_str!("../tauri.conf.json");
+
+    #[test]
+    fn bundle_identifier_correct() {
+        let json: Value = serde_json::from_str(CONF).expect("parse tauri.conf.json");
+        assert_eq!(json["identifier"], "systems.wolfmark.augur");
+    }
+
+    #[test]
+    fn minimum_macos_version_set() {
+        let json: Value = serde_json::from_str(CONF).expect("parse tauri.conf.json");
+        assert_eq!(
+            json["bundle"]["macOS"]["minimumSystemVersion"],
+            "12.0"
+        );
+    }
+
+    #[test]
+    fn dmg_target_enabled() {
+        let json: Value = serde_json::from_str(CONF).expect("parse tauri.conf.json");
+        let targets = json["bundle"]["targets"]
+            .as_array()
+            .expect("targets is an array");
+        assert!(
+            targets.iter().any(|t| t == "dmg"),
+            "Sprint 18 P1 requires dmg in bundle.targets"
+        );
+    }
+}
+
 pub fn run() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 

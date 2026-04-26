@@ -20,6 +20,7 @@ interface Props {
   onOpenAdvisory: () => void;
   onSetCaseNumber: () => void;
   onOpenPackageWizard: () => void;
+  onOpenAbout: () => void;
 }
 
 export default function MenuBar({
@@ -27,6 +28,7 @@ export default function MenuBar({
   onOpenAdvisory,
   onSetCaseNumber,
   onOpenPackageWizard,
+  onOpenAbout,
 }: Props) {
   const [open, setOpen] = useState<string | null>(null);
   const ref = useRef<HTMLDivElement>(null);
@@ -60,9 +62,7 @@ export default function MenuBar({
   const caseNumber = useAppStore((s) => s.caseNumber);
   const setError = useAppStore((s) => s.setError);
   const startBatch = useAppStore((s) => s.startBatch);
-  const targetLang = useAppStore((s) => s.targetLang);
   const recentFiles = useAppStore((s) => s.recentFiles);
-  const loadFile = useAppStore((s) => s.loadFile);
   const flaggedSegments = useAppStore((s) => s.flaggedSegments);
 
   const handleOpen = async () => {
@@ -287,7 +287,7 @@ export default function MenuBar({
                     label="About AUGUR"
                     onClick={() => {
                       setOpen(null);
-                      window.alert("AUGUR v1.0.0 — Wolfmark Systems");
+                      onOpenAbout();
                     }}
                   />
                   <Item

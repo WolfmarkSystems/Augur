@@ -107,6 +107,28 @@ async fn launch_augur(app: AppHandle) -> Result<(), String> {
 /// Entry point shared by the binary (`src/main.rs`) and any
 /// future test harnesses. Splitting the Tauri builder out of
 /// `main` lets us unit-test the command surface in isolation.
+#[cfg(test)]
+mod tauri_conf_tests {
+    use serde_json::Value;
+
+    const CONF: &str = include_str!("../tauri.conf.json");
+
+    #[test]
+    fn bundle_identifier_correct() {
+        let json: Value = serde_json::from_str(CONF).expect("parse tauri.conf.json");
+        assert_eq!(json["identifier"], "systems.wolfmark.augur.installer");
+    }
+
+    #[test]
+    fn minimum_macos_version_set() {
+        let json: Value = serde_json::from_str(CONF).expect("parse tauri.conf.json");
+        assert_eq!(
+            json["bundle"]["macOS"]["minimumSystemVersion"],
+            "12.0"
+        );
+    }
+}
+
 pub fn run() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 

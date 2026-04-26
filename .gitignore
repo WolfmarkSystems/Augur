@@ -18,3 +18,4 @@ weights/
 *.swo
 .idea/
 .vscode/
+releases/

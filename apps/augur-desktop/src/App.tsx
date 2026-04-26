@@ -10,6 +10,7 @@ import WorkspaceBatch from "./components/WorkspaceBatch";
 import ModelManager from "./components/ModelManager";
 import PackageWizard from "./components/PackageWizard";
 import ReviewPanel from "./components/ReviewPanel";
+import AboutDialog from "./components/AboutDialog";
 import ErrorBanner, { type ErrorBannerType } from "./components/ErrorBanner";
 import { invoke } from "@tauri-apps/api/core";
 import {
@@ -64,6 +65,7 @@ export default function App() {
   const [showModelManager, setShowModelManager] = useState(false);
   const [showPackageWizard, setShowPackageWizard] = useState(false);
   const [showAdvisory, setShowAdvisory] = useState(false);
+  const [showAbout, setShowAbout] = useState(false);
   const [advisoryText, setAdvisoryText] = useState<string>(MT_ADVISORY_FALLBACK);
   const [bannerType, setBannerType] = useState<ErrorBannerType | null>(null);
   const [bannerMessage, setBannerMessage] = useState<string | undefined>();
@@ -320,6 +322,7 @@ export default function App() {
         onOpenModelManager={() => setShowModelManager(true)}
         onOpenAdvisory={() => setShowAdvisory(true)}
         onOpenPackageWizard={() => setShowPackageWizard(true)}
+        onOpenAbout={() => setShowAbout(true)}
         onSetCaseNumber={() => {
           const next = window.prompt(
             "Case number for exports and chain of custody:",
@@ -377,6 +380,8 @@ export default function App() {
         open={showPackageWizard}
         onClose={() => setShowPackageWizard(false)}
       />
+
+      <AboutDialog open={showAbout} onClose={() => setShowAbout(false)} />
 
       {showAdvisory && (
         <div className="overlay" role="dialog" aria-modal="true">
