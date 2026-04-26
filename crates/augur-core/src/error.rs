@@ -67,4 +67,27 @@ pub enum AugurError {
     /// fired before the operation completed.
     #[error("operation timed out after {seconds}s")]
     ProcessTimeout { seconds: u64 },
+
+    /// Sprint 10 P1 — `augur install <profile>` was invoked with an
+    /// unknown profile name. Carries the offending value so the
+    /// CLI can echo it back unmodified.
+    #[error("invalid install profile: {0} (expected: minimal|standard|full)")]
+    InvalidProfile(String),
+
+    /// Sprint 10 P1 — SHA-256 verification failed after a model
+    /// download. The downloaded file is left on disk for manual
+    /// inspection; the installer aborts the rest of the profile.
+    #[error("integrity failure for model {model}: expected {expected}, got {computed}")]
+    IntegrityFailure {
+        model: String,
+        expected: String,
+        computed: String,
+    },
+
+    /// Sprint 10 P1 — `augur install <profile>` could not retrieve
+    /// the model. Distinct from `Io(...)` so the CLI can surface a
+    /// "check your network or use airgap install" hint without
+    /// string-matching.
+    #[error("download failed for {model}: {reason}")]
+    DownloadFailed { model: String, reason: String },
 }

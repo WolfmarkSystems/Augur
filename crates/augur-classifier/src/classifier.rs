@@ -419,7 +419,16 @@ impl LanguageClassifier {
         let (arabic_dialect, arabic_dialect_confidence,
              arabic_dialect_indicators, arabic_dialect_note) =
             if final_language == "ar" {
-                let analysis = crate::detect_arabic_dialect(text);
+                // Sprint 10 P4 — prefer CAMeL Tools when its
+                // model is installed; fall back to the lexical
+                // detector. Probe the registry, not the
+                // filesystem directly, so a relocated cache
+                // (`AUGUR_MODEL_CACHE`) is honoured.
+                let camel_installed =
+                    augur_core::models::find_model("camel-arabic")
+                        .map(augur_core::models::is_installed)
+                        .unwrap_or(false);
+                let analysis = crate::camel::classify_arabic_dialect(text, camel_installed);
                 let note = if analysis.advisory.is_empty() {
                     None
                 } else {

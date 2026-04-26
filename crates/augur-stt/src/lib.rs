@@ -6,7 +6,10 @@
 //! latter requires cmake + a C++ toolchain).
 
 pub mod diarize;
+pub mod model_select;
 pub mod whisper;
+
+pub use model_select::{auto_select_whisper_model, WhisperModel};
 
 pub use diarize::{
     merge_stt_with_diarization, DiarizationEngine, DiarizationSegment, EnrichedSegment,

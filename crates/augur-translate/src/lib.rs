@@ -33,6 +33,12 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use augur_core::AugurError;
 
+pub mod seamless;
+pub use seamless::{
+    detect_code_switching, select_engine, CodeSwitchAnalysis, SeamlessEngine,
+    TranslationEngineKind, DEFAULT_SEAMLESS_MODEL, SEAMLESS_ADVISORY,
+};
+
 /// Sprint-1 sentinel. Retained so callers/tests that grep for it
 /// have a single removal point. Sprint 2 wires real translation
 /// via [`TranslationEngine`]; this sentinel is no longer emitted

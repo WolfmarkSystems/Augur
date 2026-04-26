@@ -405,6 +405,8 @@ pub fn run_self_test(full: bool) -> Result<SelfTestResult, AugurError> {
         "Translation: NLLB-200 cached",
         &cache_root.join("nllb"),
     ));
+    checks.push(run_whisper_install_check());
+    checks.push(run_translation_install_check());
     checks.push(run_airgap_check());
     checks.push(run_hf_token_check());
     checks.push(run_geoip_check());
@@ -413,6 +415,74 @@ pub fn run_self_test(full: bool) -> Result<SelfTestResult, AugurError> {
     }
     checks.push(offline_invariant_check(full));
     Ok(SelfTestResult::from_checks(checks))
+}
+
+/// Sprint 10 P2 — report which Whisper models are materialised
+/// in the cache. Pass when Tiny is at least available (the
+/// minimum-viable STT footprint); warn when nothing is installed
+/// so first-run inference will trigger a download.
+fn run_whisper_install_check() -> SelfTestCheck {
+    use augur_core::models::{find_model, is_installed};
+    let entries = [
+        ("Whisper Tiny", "whisper-tiny"),
+        ("Whisper Base", "whisper-base"),
+        ("Whisper Large-v3", "whisper-large-v3"),
+        ("Whisper Pashto", "whisper-pashto"),
+        ("Whisper Dari", "whisper-dari"),
+    ];
+    let mut installed: Vec<&str> = Vec::new();
+    let mut missing: Vec<&str> = Vec::new();
+    for (label, id) in entries {
+        let present = find_model(id).map(is_installed).unwrap_or(false);
+        if present {
+            installed.push(label);
+        } else {
+            missing.push(label);
+        }
+    }
+    if installed.is_empty() {
+        return SelfTestCheck {
+            name: "STT models: Whisper installed".into(),
+            status: CheckStatus::Skip,
+            message: "no Whisper models installed (run `augur install minimal`)".into(),
+        };
+    }
+    SelfTestCheck {
+        name: "STT models: Whisper installed".into(),
+        status: CheckStatus::Pass,
+        message: format!("installed: {}; missing: {}", installed.join(", "), missing.join(", ")),
+    }
+}
+
+/// Sprint 10 P2/P3 — report installed translation engines.
+fn run_translation_install_check() -> SelfTestCheck {
+    use augur_core::models::{find_model, is_installed};
+    let entries = [
+        ("NLLB-200 600M", "nllb-600m"),
+        ("NLLB-200 1.3B", "nllb-1.3b"),
+        ("SeamlessM4T Medium", "seamless-m4t-medium"),
+        ("CAMeL Arabic", "camel-arabic"),
+    ];
+    let mut installed: Vec<&str> = Vec::new();
+    let mut missing: Vec<&str> = Vec::new();
+    for (label, id) in entries {
+        let present = find_model(id).map(is_installed).unwrap_or(false);
+        if present {
+            installed.push(label);
+        } else {
+            missing.push(label);
+        }
+    }
+    let status = if installed.is_empty() {
+        CheckStatus::Skip
+    } else {
+        CheckStatus::Pass
+    };
+    SelfTestCheck {
+        name: "Translation models installed".into(),
+        status,
+        message: format!("installed: {}; missing: {}", installed.join(", "), missing.join(", ")),
+    }
 }
 
 fn home_relative(rel: &str) -> Option<PathBuf> {

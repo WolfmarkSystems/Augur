@@ -11,6 +11,7 @@
 
 pub mod error;
 pub mod geoip;
+pub mod models;
 pub mod pipeline;
 pub mod report;
 pub mod resilience;

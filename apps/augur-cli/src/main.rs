@@ -6,6 +6,7 @@
 //! translation; Sprint 2 replaces the stubs.
 
 mod benchmark;
+mod install;
 mod package;
 mod selftest;
 
@@ -32,11 +33,11 @@ use augur_ocr::{extract_pdf_text, iso_to_tesseract, OcrEngine};
 use augur_stt::{
     extract_audio_from_video, merge_stt_with_diarization, DiarizationEngine, DiarizationSegment,
     EnrichedSegment, HfTokenManager, ModelManager as WhisperModelManager, SttEngine, SttResult,
-    SttSegment, TranscribeOptions, WhisperPreset,
+    SttSegment, TranscribeOptions, WhisperModel, WhisperPreset,
 };
 use augur_translate::{
-    Backend as TranslationBackend, TranslationEngine, TranslationResult,
-    MACHINE_TRANSLATION_NOTICE,
+    Backend as TranslationBackend, SeamlessEngine, TranslationEngine, TranslationEngineKind,
+    TranslationResult, MACHINE_TRANSLATION_NOTICE,
 };
 
 /// Exact `--version` / `-V` output. Kept as a `const` so it's
@@ -147,6 +148,13 @@ enum Command {
         #[arg(long, value_enum, default_value_t = CliPreset::Balanced)]
         preset: CliPreset,
 
+        /// Sprint 10 P2 — concrete Whisper model. `auto` (the
+        /// default) cascades from the largest installed model
+        /// (Large-v3 → Base → Tiny). Overrides `--preset` when
+        /// set to anything other than `auto`.
+        #[arg(long, value_enum, default_value_t = CliWhisperModel::Auto)]
+        model: CliWhisperModel,
+
         /// Initial decoding temperature. `0.0` is greedy (default).
         /// Higher values introduce sampling and are used by the
         /// retry loop on hard audio.
@@ -194,6 +202,18 @@ enum Command {
         /// Whisper model preset.
         #[arg(long, value_enum, default_value_t = CliPreset::Balanced)]
         preset: CliPreset,
+
+        /// Sprint 10 P2 — concrete Whisper model (auto-cascades
+        /// to the largest installed when `auto`).
+        #[arg(long, value_enum, default_value_t = CliWhisperModel::Auto)]
+        model: CliWhisperModel,
+
+        /// Sprint 10 P3 — translation engine. `nllb` (default)
+        /// uses NLLB-200; `seamless` routes through SeamlessM4T
+        /// for code-switched input; `auto` picks per-input based
+        /// on classifier confidence and script-mix heuristics.
+        #[arg(long, value_enum, default_value_t = CliEngine::Nllb)]
+        engine: CliEngine,
 
         /// Super Sprint Group B P3 — path to a YARA rules file
         /// (or directory). When set, the translated text AND the
@@ -441,6 +461,39 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         threads: usize,
     },
+
+    /// Sprint 10 P1 — manage the model catalog. Three install
+    /// tiers (minimal / standard / full); `--list` prints the
+    /// catalog without touching the network; `--status` shows what
+    /// is currently materialised on disk; `--airgap` builds a tar
+    /// of an installed tier for transfer to a SCIF / disconnected
+    /// host.
+    Install {
+        /// Install profile: `minimal` (~2.5 GB) / `standard` (~11 GB)
+        /// / `full` (~15 GB). Required unless `--list`, `--status`,
+        /// or (with `--airgap`) `--profile` are supplied.
+        profile: Option<String>,
+
+        /// Print the model catalog (no network).
+        #[arg(long, default_value_t = false)]
+        list: bool,
+
+        /// Print install status (no network).
+        #[arg(long, default_value_t = false)]
+        status: bool,
+
+        /// Build an air-gap package archive at this path. Requires
+        /// the chosen profile's models to already be installed
+        /// locally; the archive bundles the model cache plus a
+        /// manifest + README.
+        #[arg(long)]
+        airgap: Option<PathBuf>,
+
+        /// Profile to bundle when `--airgap` is set. Defaults to
+        /// `standard`.
+        #[arg(long)]
+        profile_for_airgap: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -483,6 +536,51 @@ enum CliPreset {
     Fast,
     Balanced,
     Accurate,
+}
+
+/// Sprint 10 P2 — `--model` value enum on transcribe/translate.
+/// Unlike `CliPreset` (which names the candle architecture class),
+/// `CliWhisperModel` names a specific installed model + supports
+/// the `auto` cascade.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliWhisperModel {
+    Auto,
+    Tiny,
+    Base,
+    LargeV3,
+    Pashto,
+    Dari,
+}
+
+/// Sprint 10 P3 — `--engine` value enum on translate.
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+enum CliEngine {
+    Nllb,
+    Seamless,
+    Auto,
+}
+
+impl From<CliEngine> for TranslationEngineKind {
+    fn from(c: CliEngine) -> Self {
+        match c {
+            CliEngine::Nllb => TranslationEngineKind::Nllb,
+            CliEngine::Seamless => TranslationEngineKind::Seamless,
+            CliEngine::Auto => TranslationEngineKind::Auto,
+        }
+    }
+}
+
+impl CliWhisperModel {
+    fn into_model(self, detected_language: Option<&str>) -> WhisperModel {
+        match self {
+            Self::Auto => augur_stt::auto_select_whisper_model(detected_language),
+            Self::Tiny => WhisperModel::Tiny,
+            Self::Base => WhisperModel::Base,
+            Self::LargeV3 => WhisperModel::LargeV3,
+            Self::Pashto => WhisperModel::Pashto,
+            Self::Dari => WhisperModel::Dari,
+        }
+    }
 }
 
 impl From<CliPreset> for WhisperPreset {
@@ -541,9 +639,20 @@ fn run(
         Command::Transcribe {
             input,
             preset,
+            model,
             temperature,
             max_retries,
-        } => cmd_transcribe(&input, preset.into(), temperature, max_retries),
+        } => {
+            // Sprint 10 P2 — `--model` overrides `--preset` when
+            // it resolves to a different concrete preset. `auto`
+            // cascades to the largest installed.
+            let resolved = model.into_model(None);
+            let effective_preset = match model {
+                CliWhisperModel::Auto => preset.into(),
+                _ => resolved.resolved_preset(),
+            };
+            cmd_transcribe(&input, effective_preset, temperature, max_retries)
+        }
         Command::Translate {
             input,
             text,
@@ -551,22 +660,32 @@ fn run(
             ocr_lang,
             target,
             preset,
+            model,
+            engine,
             output_srt,
             diarize,
             yara_rules,
-        } => cmd_translate(
-            input.as_deref(),
-            text.as_deref(),
-            image.as_deref(),
-            &ocr_lang,
-            &target,
-            preset.into(),
-            backend,
-            translation_backend,
-            diarize,
-            output_srt.as_deref(),
-            yara_rules.as_deref(),
-        ),
+        } => {
+            let resolved = model.into_model(None);
+            let effective_preset = match model {
+                CliWhisperModel::Auto => preset.into(),
+                _ => resolved.resolved_preset(),
+            };
+            cmd_translate(
+                input.as_deref(),
+                text.as_deref(),
+                image.as_deref(),
+                &ocr_lang,
+                &target,
+                effective_preset,
+                backend,
+                translation_backend,
+                engine.into(),
+                diarize,
+                output_srt.as_deref(),
+                yara_rules.as_deref(),
+            )
+        }
         Command::Setup { hf_token } => cmd_setup(&hf_token),
         Command::Docs { topic } => cmd_docs(topic.as_deref()),
         Command::Benchmark {
@@ -627,6 +746,24 @@ fn run(
             threads,
         ),
         Command::Config { action } => cmd_config(action),
+        Command::Install {
+            profile,
+            list,
+            status,
+            airgap,
+            profile_for_airgap,
+        } => {
+            // When --airgap is set, profile_for_airgap (or the
+            // positional profile) names the tier to bundle. When
+            // --airgap is absent, the positional profile is the
+            // tier to install.
+            let profile_arg = if airgap.is_some() {
+                profile_for_airgap.as_deref().or(profile.as_deref())
+            } else {
+                profile.as_deref()
+            };
+            install::cmd_install(profile_arg, list, status, airgap.as_deref())
+        }
     }
 }
 
@@ -772,6 +909,7 @@ fn cmd_translate(
     preset: WhisperPreset,
     backend: ClassifierBackend,
     translation_backend: TranslationBackend,
+    engine_kind: TranslationEngineKind,
     diarize: bool,
     output_srt: Option<&std::path::Path>,
     yara_rules: Option<&std::path::Path>,
@@ -904,27 +1042,63 @@ fn cmd_translate(
         return Ok(());
     }
 
-    let mut engine = TranslationEngine::with_xdg_cache()?;
-    engine.backend = translation_backend;
-    let translation = if let Some(segs) = &resolved.segments {
-        let trips: Vec<(u64, u64, String)> = segs
-            .iter()
-            .map(|s| (s.start_ms, s.end_ms, s.text.clone()))
-            .collect();
-        println_verify(format!(
-            "Translating {} segment(s) {} → {} via NLLB-200 ({:?})...",
-            trips.len(),
-            lang,
-            target,
-            engine.backend
+    // Sprint 10 P3 — engine selection. Default `Nllb` keeps the
+    // legacy single-language path. `Seamless` routes through
+    // SeamlessM4T (handles code-switching). `Auto` defers to
+    // `select_engine` heuristics — only chooses Seamless if it is
+    // actually installed.
+    let seamless_installed = augur_core::models::find_model("seamless-m4t-medium")
+        .map(augur_core::models::is_installed)
+        .unwrap_or(false);
+    let resolved_engine = match engine_kind {
+        TranslationEngineKind::Nllb => TranslationEngineKind::Nllb,
+        TranslationEngineKind::Seamless => TranslationEngineKind::Seamless,
+        TranslationEngineKind::Auto => augur_translate::select_engine(
+            &resolved.text,
+            &lang,
+            resolved.upstream_confidence,
+            seamless_installed,
+        ),
+    };
+    if matches!(resolved_engine, TranslationEngineKind::Seamless) && !seamless_installed {
+        return Err(AugurError::InvalidInput(
+            "--engine seamless requires `augur install full` (seamless-m4t-medium not installed)"
+                .to_string(),
         ));
-        engine.translate_segments(&trips, &lang, target)?
-    } else {
-        println_verify(format!(
-            "Translating {lang} → {target} via NLLB-200 ({:?})...",
-            engine.backend
-        ));
-        engine.translate(&resolved.text, &lang, target)?
+    }
+
+    let translation = match resolved_engine {
+        TranslationEngineKind::Seamless => {
+            println_verify(format!(
+                "Translating {lang} → {target} via SeamlessM4T..."
+            ));
+            let seamless = SeamlessEngine::with_xdg_cache()?;
+            seamless.translate(&resolved.text, &lang, target)?
+        }
+        _ => {
+            let mut engine = TranslationEngine::with_xdg_cache()?;
+            engine.backend = translation_backend;
+            if let Some(segs) = &resolved.segments {
+                let trips: Vec<(u64, u64, String)> = segs
+                    .iter()
+                    .map(|s| (s.start_ms, s.end_ms, s.text.clone()))
+                    .collect();
+                println_verify(format!(
+                    "Translating {} segment(s) {} → {} via NLLB-200 ({:?})...",
+                    trips.len(),
+                    lang,
+                    target,
+                    engine.backend
+                ));
+                engine.translate_segments(&trips, &lang, target)?
+            } else {
+                println_verify(format!(
+                    "Translating {lang} → {target} via NLLB-200 ({:?})...",
+                    engine.backend
+                ));
+                engine.translate(&resolved.text, &lang, target)?
+            }
+        }
     };
 
     if let (Some(diar), Some(translated)) = (&diarization_segments, &translation.segments) {
@@ -2427,6 +2601,13 @@ fn try_run_stt_with(
 /// one place a reviewer can audit.
 fn println_verify<S: AsRef<str>>(line: S) {
     println!("[AUGUR] {}", line.as_ref());
+}
+
+/// Sprint 10 — public alias used by sibling modules
+/// (`install.rs`, future GUI shims). The original name is kept
+/// to avoid touching ~100 internal call sites.
+pub(crate) fn println_augur<S: AsRef<str>>(line: S) {
+    println_verify(line)
 }
 
 #[cfg(test)]

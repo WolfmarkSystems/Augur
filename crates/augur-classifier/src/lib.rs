@@ -5,10 +5,12 @@
 //! foreign subset is queued for STT + NLLB.
 
 pub mod arabic_dialect;
+pub mod camel;
 pub mod classifier;
 pub mod script;
 
 pub use arabic_dialect::{detect_arabic_dialect, ArabicDialect, DialectAnalysis};
+pub use camel::{classify_arabic_dialect, run_camel, CAMEL_DIALECT_ADVISORY};
 pub use classifier::{
     classify_confidence, confidence_advisory, ClassificationResult, ConfidenceTier,
     LanguageClassifier, ModelManager, SHORT_INPUT_WORD_COUNT,
