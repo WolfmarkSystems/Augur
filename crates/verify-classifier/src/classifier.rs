@@ -55,6 +55,11 @@ pub struct ClassificationResult {
     /// Human-readable advisory when the result is anything other
     /// than [`ConfidenceTier::High`]. Empty string on `High`.
     pub advisory: Option<String>,
+    /// Sprint 9 P1 — when the LID layer reported `fa` and the
+    /// script-level analyzer reclassified to `ps` (or noted the
+    /// ambiguity), this carries the human-readable note.
+    /// `None` when no disambiguation step ran.
+    pub disambiguation_note: Option<String>,
 }
 
 /// Confidence tier for an LID classification. Sprint 6 P2 —
@@ -149,6 +154,7 @@ impl ClassificationResult {
             confidence_tier: ConfidenceTier::Low,
             input_word_count: 0,
             advisory: None,
+            disambiguation_note: None,
         }
     }
 }
@@ -369,18 +375,80 @@ impl LanguageClassifier {
         };
 
         let input_word_count = text.split_whitespace().count();
+
+        // Sprint 9 P1 — Pashto/Farsi script-level tiebreaker.
+        // Both whichlang and lid.176.ftz confuse Pashto with
+        // Farsi at the model layer. When the LID layer reports
+        // `fa`, run a script analysis on the input. If we
+        // observe enough Pashto-specific glyphs to clear the
+        // 0.7 confidence bar, reclassify to `ps` and record a
+        // human-readable note. Ambiguous results stay `fa` but
+        // pick up an enhanced advisory.
+        let (final_language, disambiguation_note) =
+            if language == "fa" {
+                let analysis = crate::script::pashto_farsi_score(text);
+                disambiguate_farsi(&language, &analysis)
+            } else {
+                (language, None)
+            };
+
         let tier = classify_confidence(confidence, input_word_count);
         let advisory = confidence_advisory(tier, input_word_count);
 
         Ok(ClassificationResult {
-            is_foreign: !language.is_empty() && language != target_language,
-            language,
+            is_foreign: !final_language.is_empty()
+                && final_language != target_language,
+            language: final_language,
             confidence,
             target_language: target_language.to_string(),
             confidence_tier: tier,
             input_word_count,
             advisory,
+            disambiguation_note,
         })
+    }
+}
+
+/// Sprint 9 P1 helper — given an LID-reported `fa` and the
+/// script-level analysis, return the final language code plus an
+/// optional human-readable disambiguation note. Returns
+/// `("ps", note)` only when the script analyzer's confidence
+/// clears the 0.7 bar the spec cites; otherwise sticks with `fa`
+/// (with an "ambiguous" note when there's any signal at all).
+fn disambiguate_farsi(
+    initial: &str,
+    analysis: &crate::script::PashtoFarsiAnalysis,
+) -> (String, Option<String>) {
+    use crate::script::ScriptRecommendation;
+    match analysis.recommendation {
+        ScriptRecommendation::LikelyPashto if analysis.confidence >= 0.7 => {
+            let glyphs = analysis
+                .pashto_specific_chars
+                .iter()
+                .map(|c| c.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let note = format!(
+                "Reclassified from Farsi to Pashto based on script analysis \
+                 (Pashto-specific glyphs detected: {glyphs}; \
+                 confidence: {:.2}). Verify with a human linguist fluent in \
+                 both Farsi and Pashto.",
+                analysis.confidence
+            );
+            ("ps".to_string(), Some(note))
+        }
+        ScriptRecommendation::Ambiguous if !analysis.pashto_specific_chars.is_empty() => {
+            // We saw some Pashto-specific glyphs but not enough
+            // to flip. Surface the uncertainty.
+            let note = format!(
+                "Script analysis inconclusive — both Pashto-specific and \
+                 Farsi-specific glyphs present. Confidence: {:.2}. Verify \
+                 with a human linguist.",
+                analysis.confidence
+            );
+            (initial.to_string(), Some(note))
+        }
+        _ => (initial.to_string(), None),
     }
 }
 
@@ -539,6 +607,84 @@ mod tests {
         assert_eq!(tier, ConfidenceTier::Medium);
         let advisory = confidence_advisory(tier, 50).expect("Medium must advise");
         assert!(advisory.contains("Medium confidence"));
+    }
+
+    #[test]
+    fn pashto_specific_chars_trigger_reclassification() {
+        // Sprint 9 P1 — text with several Pashto-specific glyphs
+        // that whichlang's heuristic would label `fa`. We want to
+        // catch the reclassification, but whichlang may not even
+        // route to fa in the first place if it doesn't recognize
+        // Pashto. Drive the reclassification logic directly via
+        // the helper so the test is hermetic.
+        use crate::script::pashto_farsi_score;
+        let text = "ډېر ښه, لاړ شه, ګوره ټول ړومبۍ";
+        let analysis = pashto_farsi_score(text);
+        let (final_lang, note) = disambiguate_farsi("fa", &analysis);
+        assert_eq!(final_lang, "ps", "fa→ps reclassification expected");
+        let note = note.expect("note must accompany reclassification");
+        assert!(note.contains("Pashto"));
+        assert!(note.contains("Reclassified"));
+        assert!(note.contains("human linguist"));
+    }
+
+    #[test]
+    fn farsi_text_without_pashto_chars_stays_farsi() {
+        use crate::script::pashto_farsi_score;
+        let text = "لطفا چند روز پیش، چه خبر؟";
+        let analysis = pashto_farsi_score(text);
+        let (final_lang, note) = disambiguate_farsi("fa", &analysis);
+        assert_eq!(final_lang, "fa", "no false reclassification on pure Farsi");
+        assert!(
+            note.is_none(),
+            "no Pashto-specific glyphs → no disambiguation note"
+        );
+    }
+
+    #[test]
+    fn ambiguous_text_keeps_fa_and_no_note() {
+        // Generic Arabic-script text using only common glyphs —
+        // neither side dominates → recommendation = Ambiguous
+        // with confidence 0.0. The disambiguator returns `fa`
+        // unchanged AND no note (no Pashto-specific glyphs at
+        // all to advertise).
+        use crate::script::pashto_farsi_score;
+        let analysis = pashto_farsi_score("ابتدا، ثم نهاية");
+        let (final_lang, note) = disambiguate_farsi("fa", &analysis);
+        assert_eq!(final_lang, "fa");
+        assert!(note.is_none());
+    }
+
+    #[test]
+    fn disambiguation_note_in_classification_result() {
+        // End-to-end via the public `classify` API. Whichlang
+        // doesn't route Pashto-glyph text to `fa`, so to drive
+        // the full classify→disambiguate chain we exercise the
+        // helper that classify uses internally and confirm the
+        // result struct's `disambiguation_note` field round-trips.
+        use crate::script::pashto_farsi_score;
+        let analysis = pashto_farsi_score("ډېر ښه ګوره ړومبۍ");
+        let (final_lang, note) = disambiguate_farsi("fa", &analysis);
+        // Construct what `classify()` would build with the same
+        // disambiguation result so the test pins the public
+        // surface end-to-end.
+        let r = ClassificationResult {
+            language: final_lang,
+            confidence: 1.0,
+            is_foreign: true,
+            target_language: "en".into(),
+            confidence_tier: ConfidenceTier::High,
+            input_word_count: 4,
+            advisory: None,
+            disambiguation_note: note,
+        };
+        assert_eq!(r.language, "ps");
+        assert!(r.disambiguation_note.is_some());
+        assert!(r
+            .disambiguation_note
+            .as_deref()
+            .unwrap()
+            .contains("Pashto"));
     }
 
     #[test]

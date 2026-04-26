@@ -5,8 +5,12 @@
 //! foreign subset is queued for STT + NLLB.
 
 pub mod classifier;
+pub mod script;
 
 pub use classifier::{
     classify_confidence, confidence_advisory, ClassificationResult, ConfidenceTier,
     LanguageClassifier, ModelManager, SHORT_INPUT_WORD_COUNT,
+};
+pub use script::{
+    pashto_farsi_score, PashtoFarsiAnalysis, ScriptRecommendation,
 };

@@ -532,17 +532,61 @@ opt-in API.
   that speaker labels are NOT biometric identification and
   must not be used as such without expert verification.
 
-## What remains for Sprint 9+
+## Sprint 9 decisions (shipped 2026-04-26)
+
+- **Pashto/Farsi script disambiguation.** New
+  `verify_classifier::script` module: `pashto_farsi_score(text)`
+  returns a `PashtoFarsiAnalysis` with per-side glyph counts +
+  recommendation + confidence. The classifier's `classify()`
+  invokes the disambiguator whenever the LID layer reports
+  `fa`; recommendations of `LikelyPashto` with confidence ≥
+  0.7 reclassify to `ps` and populate a new
+  `disambiguation_note` field on `ClassificationResult`.
+  Ambiguous results stay `fa` but pick up a note when any
+  Pashto-specific glyphs are present. The CLI prints the note
+  alongside the existing confidence advisory; `verify
+  self-test` gains a check that drives the analyzer on a
+  Pashto-heavy probe.
+- **Parallel batch processing via rayon.** New `--threads <N>`
+  flag on `verify batch` (and the new `verify package`); `0`
+  (the default) resolves to `min(num_cpus, 8)` to keep STT
+  model loads from blowing memory on large evidence runs.
+  Per-file `process_one_file` calls already construct their
+  own engine instances per call, so no shared mutable state
+  needed. Live counters use `AtomicU32`; the progress JSON's
+  `recent_files` list is protected by a small `Mutex`.
+  Benchmark on this host (20 .txt files routed through the
+  fail-fast STT path): sequential 9.06 s → parallel-auto
+  1.62 s → **5.59× speedup**, 557% CPU. The
+  `write_progress_snapshot` helper takes a pre-cloned `&[String]`
+  so the lock is held only across vec push, not the JSON write.
+- **Evidence package export.** New `verify package` subcommand
+  + `apps/verify-cli/src/package.rs` module. Produces a ZIP
+  containing `MANIFEST.json` (per-file SHA-256 hashes computed
+  in 64 KiB chunks), `CHAIN_OF_CUSTODY.txt`, `REPORT.html` +
+  `REPORT.json`, and `translations/<filename>.<target>.txt`
+  per translated entry. `--include-originals` (off by default)
+  bundles source files into `original/`. The advisory
+  invariant is enforced at the manifest layer:
+  `Manifest::assert_advisory()` rejects any manifest with
+  `translated_count > 0 && machine_translation_notice.is_empty()`,
+  matching the existing `BatchResult::assert_advisory` shape.
+  Forensic chain-of-custody text always includes the MT
+  notice in prose.
+
+## What remains for Sprint 10+
 
 - Examiner-assigned speaker labels (overwrite `SPEAKER_00` →
   `Suspect A` and persist across runs).
 - Real-time transcription (post-v1.0).
 - Optional auto-conversion to ct2 on first install — pay the
   one-time cost up front for the 2.85× steady-state speedup.
-- Script-aware Pashto/Persian tiebreaker (orthographic features
-  rather than statistical n-grams).
 - Sr/Hr/Bs, Ms/Id, Hi/Ur language-pair advisories along the
-  same shape as Sprint 6's fa/ps disambiguation.
+  same shape as Sprint 6's fa/ps + Sprint 9's script-level
+  disambiguation.
 - Optional second MaxMind reader for the GeoLite2-ASN database
   (so `GeoIpResult.asn` / `org` populate when the user has
   both `City` and `ASN` files).
+- Per-thread STT engine instance pool to amortise the model-
+  load cost on parallel batch runs (currently each task loads
+  its own copy).

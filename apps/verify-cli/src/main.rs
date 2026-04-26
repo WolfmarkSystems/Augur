@@ -5,6 +5,7 @@
 //! fastText or whichlang) plus Sprint-1 stubs for STT and
 //! translation; Sprint 2 replaces the stubs.
 
+mod package;
 mod selftest;
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -198,6 +199,55 @@ enum Command {
         diarize: bool,
     },
 
+    /// Build an evidence-export ZIP from a previously-run batch
+    /// report (or an evidence directory plus a fresh classify
+    /// pass). The package contains MANIFEST.json (with SHA-256
+    /// hashes of every original), CHAIN_OF_CUSTODY.txt, the
+    /// rendered HTML/JSON reports, and per-file translation
+    /// `.txt` artifacts. By default, source files are NOT copied
+    /// into the package — pass `--include-originals` to include
+    /// them.
+    Package {
+        /// Evidence directory to package. The CLI runs a batch
+        /// pass internally to gather classifications and
+        /// translations, then assembles the ZIP.
+        #[arg(long)]
+        input: PathBuf,
+
+        /// Output ZIP path. Defaults to
+        /// `verify-package-<YYYYMMDD>.zip` in the current dir.
+        #[arg(long)]
+        output: Option<PathBuf>,
+
+        /// Target language for translations. Same semantics as
+        /// `verify batch --target`.
+        #[arg(long, default_value = "en")]
+        target: String,
+
+        /// Optional `verify config` TOML — supplies agency /
+        /// case / examiner metadata for the manifest and chain
+        /// of custody.
+        #[arg(long)]
+        config: Option<PathBuf>,
+
+        /// Whisper preset for any audio/video files in the
+        /// evidence directory.
+        #[arg(long, value_enum, default_value_t = CliPreset::Balanced)]
+        preset: CliPreset,
+
+        /// OCR language hint for image files.
+        #[arg(long, default_value = "en")]
+        ocr_lang: String,
+
+        /// Include the original source files inside the ZIP. Off
+        /// by default — large evidence directories make zipping
+        /// originals impractical, and the manifest's SHA-256
+        /// hashes already provide integrity verification against
+        /// the originals at their canonical location.
+        #[arg(long, default_value_t = false)]
+        include_originals: bool,
+    },
+
     /// Convert a forensic timestamp (Unix / Apple / Windows /
     /// WebKit / HFS+) into a human-readable UTC time. With no
     /// `--format`, all plausible interpretations are listed.
@@ -325,6 +375,14 @@ enum Command {
         /// differs from `--target` get translated).
         #[arg(long, default_value_t = false)]
         all_foreign: bool,
+
+        /// Sprint 9 P2 — number of worker threads for parallel
+        /// file processing. `0` (the default) means
+        /// `min(num_cpus, 8)`. Use `1` to force the previous
+        /// sequential behaviour. Cap of 8 keeps STT model loads
+        /// from blowing memory on large evidence runs.
+        #[arg(long, default_value_t = 0)]
+        threads: usize,
     },
 }
 
@@ -450,6 +508,25 @@ fn run(
         ),
         Command::Setup { hf_token } => cmd_setup(&hf_token),
         Command::SelfTest { full } => cmd_self_test(full),
+        Command::Package {
+            input,
+            output,
+            target,
+            config,
+            preset,
+            ocr_lang,
+            include_originals,
+        } => cmd_package(
+            &input,
+            output.as_deref(),
+            &target,
+            config.as_deref(),
+            preset.into(),
+            &ocr_lang,
+            include_originals,
+            backend,
+            translation_backend,
+        ),
         Command::Geoip { ip, input, setup } => cmd_geoip(ip.as_deref(), input.as_deref(), setup),
         Command::Timestamp {
             value,
@@ -466,6 +543,7 @@ fn run(
             config,
             format,
             all_foreign,
+            threads,
         } => cmd_batch(
             &input,
             &target,
@@ -478,6 +556,7 @@ fn run(
             config.as_deref(),
             format,
             all_foreign,
+            threads,
         ),
         Command::Config { action } => cmd_config(action),
     }
@@ -520,6 +599,9 @@ fn print_classification(r: &verify_classifier::ClassificationResult) {
     ));
     if let Some(adv) = &r.advisory {
         println_verify(format!("         ⚠ {adv}"));
+    }
+    if let Some(note) = &r.disambiguation_note {
+        println_verify(format!("         ⚠ {note}"));
     }
 }
 
@@ -847,6 +929,162 @@ fn best_speaker(start_ms: u64, end_ms: u64, diar: &[DiarizationSegment]) -> Stri
     }
     best.map(|(_, s)| s.to_string())
         .unwrap_or_else(|| "UNKNOWN".to_string())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_package(
+    input: &std::path::Path,
+    output: Option<&std::path::Path>,
+    target: &str,
+    config_path: Option<&std::path::Path>,
+    preset: WhisperPreset,
+    ocr_lang: &str,
+    include_originals: bool,
+    backend: ClassifierBackend,
+    translation_backend: TranslationBackend,
+) -> Result<(), VerifyError> {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use rayon::prelude::*;
+    use verify_core::pipeline::BatchSummary;
+
+    if !input.exists() || !input.is_dir() {
+        return Err(VerifyError::InvalidInput(format!(
+            "verify package --input must be a directory, got {input:?}"
+        )));
+    }
+
+    let config = load_report_config(config_path)?;
+    let zip_path: PathBuf = match output {
+        Some(p) => p.to_path_buf(),
+        None => {
+            let stamp = utc_now_iso8601()
+                .chars()
+                .take(10)
+                .collect::<String>()
+                .replace('-', "");
+            std::env::current_dir()
+                .map_err(VerifyError::Io)?
+                .join(format!("verify-package-{stamp}.zip"))
+        }
+    };
+
+    println_verify(format!(
+        "verify package: walking {input:?} (preset={preset:?}, target={target})"
+    ));
+
+    let mut files: Vec<PathBuf> = Vec::new();
+    walk_files(input, &mut files)?;
+    files.sort();
+    let mut eligible: Vec<(PathBuf, &'static str)> = Vec::with_capacity(files.len());
+    for f in &files {
+        let kind = detect_input_kind(f);
+        let label: &'static str = match &kind {
+            PipelineInput::Audio(_) => "audio",
+            PipelineInput::Video(_) => "video",
+            PipelineInput::Image(_) => "image",
+            PipelineInput::Pdf(_) => "pdf",
+            PipelineInput::Text(_) => "text",
+        };
+        eligible.push((f.clone(), label));
+    }
+
+    let processed_atomic = AtomicU32::new(0);
+    let errors_atomic = AtomicU32::new(0);
+    let foreign_atomic = AtomicU32::new(0);
+    let translated_atomic = AtomicU32::new(0);
+    let started = std::time::Instant::now();
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(resolve_thread_count(0))
+        .thread_name(|i| format!("verify-package-{i}"))
+        .build()
+        .map_err(|e| VerifyError::InvalidInput(format!("rayon pool: {e}")))?;
+    let mut results: Vec<BatchFileResult> = pool.install(|| {
+        eligible
+            .par_iter()
+            .map(|(file, kind_label)| {
+                match process_one_file(
+                    file,
+                    kind_label,
+                    target,
+                    ocr_lang,
+                    preset,
+                    backend,
+                    translation_backend,
+                ) {
+                    Ok(r) => {
+                        processed_atomic.fetch_add(1, Ordering::Relaxed);
+                        if r.is_foreign {
+                            foreign_atomic.fetch_add(1, Ordering::Relaxed);
+                        }
+                        if r.translated_text.is_some() {
+                            translated_atomic.fetch_add(1, Ordering::Relaxed);
+                        }
+                        r
+                    }
+                    Err(e) => {
+                        errors_atomic.fetch_add(1, Ordering::Relaxed);
+                        log::warn!("package: {file:?}: {e}");
+                        BatchFileResult {
+                            file_path: file.to_string_lossy().into_owned(),
+                            input_type: kind_label.to_string(),
+                            detected_language: String::new(),
+                            is_foreign: false,
+                            confidence_tier: String::new(),
+                            confidence_advisory: None,
+                            source_text: None,
+                            translated_text: None,
+                            segments: None,
+                            error: Some(e.to_string()),
+                        }
+                    }
+                }
+            })
+            .collect()
+    });
+    results.sort_by(|a, b| a.file_path.cmp(&b.file_path));
+
+    let processed = processed_atomic.load(Ordering::Relaxed);
+    let errors = errors_atomic.load(Ordering::Relaxed);
+    let foreign_count = foreign_atomic.load(Ordering::Relaxed);
+    let translated_count = translated_atomic.load(Ordering::Relaxed);
+
+    let elapsed = started.elapsed().as_secs_f64();
+    let mut report = BatchResult {
+        generated_at: utc_now_iso8601(),
+        total_files: files.len() as u32,
+        processed,
+        foreign_language: foreign_count,
+        translated: translated_count,
+        errors,
+        target_language: target.to_string(),
+        machine_translation_notice: MACHINE_TRANSLATION_NOTICE.to_string(),
+        results,
+        summary: None,
+        language_groups: Vec::new(),
+        dominant_language: None,
+    };
+    let summary: BatchSummary = report.build_summary(elapsed, MACHINE_TRANSLATION_NOTICE);
+    report.summary = Some(summary);
+    report.build_language_groups();
+    report.assert_advisory()?;
+
+    let manifest = package::write_package(
+        &zip_path,
+        &report,
+        &config,
+        input,
+        include_originals,
+    )?;
+    println_verify(format!(
+        "Package written to {zip_path:?} ({} files, {} translated, {} errors)",
+        manifest.file_count, manifest.translated_count, errors,
+    ));
+    if !include_originals {
+        println_verify(
+            "(originals NOT included — pass --include-originals to bundle source files)",
+        );
+    }
+    Ok(())
 }
 
 fn cmd_self_test(full: bool) -> Result<(), VerifyError> {
@@ -1187,8 +1425,10 @@ fn cmd_batch(
     config_path: Option<&std::path::Path>,
     format: CliReportFormat,
     all_foreign: bool,
+    threads: usize,
 ) -> Result<(), VerifyError> {
     let config = load_report_config(config_path)?;
+    let resolved_threads = resolve_thread_count(threads);
     if all_foreign {
         // The Sprint 8 default already classifies and translates
         // every non-`--target` file. The flag is plumbed for
@@ -1238,11 +1478,6 @@ fn cmd_batch(
         },
     ));
 
-    let mut results: Vec<BatchFileResult> = Vec::with_capacity(files.len());
-    let mut processed = 0u32;
-    let mut errors = 0u32;
-    let mut foreign_count = 0u32;
-    let mut translated_count = 0u32;
     let total = files.len() as u32;
     let started = std::time::Instant::now();
 
@@ -1259,9 +1494,14 @@ fn cmd_batch(
         q
     });
 
-    for (idx, file) in files.iter().enumerate() {
+    // Sprint 9 P2 — pre-filter the file list per `--types` so the
+    // rayon iterator processes only the eligible inputs. Each
+    // entry pairs the file path with its kind_label so we don't
+    // call `detect_input_kind` twice.
+    let mut eligible: Vec<(PathBuf, &'static str)> = Vec::with_capacity(files.len());
+    for file in &files {
         let kind = detect_input_kind(file);
-        let kind_label = match &kind {
+        let kind_label: &'static str = match &kind {
             PipelineInput::Audio(_) => "audio",
             PipelineInput::Video(_) => "video",
             PipelineInput::Image(_) => "image",
@@ -1273,69 +1513,116 @@ fn cmd_batch(
                 continue;
             }
         }
-        println_verify(format!(
-            "[{}/{}] {kind_label}: {file:?}",
-            idx + 1,
-            total
-        ));
-        match process_one_file(
-            file,
-            kind_label,
-            target,
-            ocr_lang,
-            preset,
-            backend,
-            translation_backend,
-        ) {
-            Ok(r) => {
-                processed += 1;
-                if r.is_foreign {
-                    foreign_count += 1;
-                }
-                if r.translated_text.is_some() {
-                    translated_count += 1;
-                }
-                results.push(r);
-            }
-            Err(e) => {
-                errors += 1;
-                log::warn!("batch: {file:?}: {e}");
-                results.push(BatchFileResult {
-                    file_path: file.to_string_lossy().into_owned(),
-                    input_type: kind_label.to_string(),
-                    detected_language: String::new(),
-                    is_foreign: false,
-                    confidence_tier: String::new(),
-                    confidence_advisory: None,
-                    source_text: None,
-                    translated_text: None,
-                    segments: None,
-                    error: Some(e.to_string()),
-                });
-            }
-        }
-
-        if let Some(pp) = &progress_path {
-            // Best-effort: write a snapshot for `tail`-style
-            // monitoring. A failure to write must not abort the
-            // batch — log + continue. We serialize a lightweight
-            // view (counts + last-N file paths) rather than the
-            // full results vec so this stays O(1) per file.
-            if let Err(e) = write_progress(
-                pp,
-                target,
-                total,
-                processed,
-                foreign_count,
-                translated_count,
-                errors,
-                &results,
-                started.elapsed().as_secs_f64(),
-            ) {
-                log::warn!("batch: failed writing progress file {pp:?}: {e}");
-            }
-        }
+        eligible.push((file.clone(), kind_label));
     }
+
+    println_verify(format!(
+        "Processing {} eligible file(s) with {} worker thread(s)...",
+        eligible.len(),
+        resolved_threads,
+    ));
+
+    use rayon::prelude::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Mutex;
+
+    // Live counters incremented from worker threads. Atomic so
+    // we can build the progress snapshot without locking the
+    // results vec on every file.
+    let processed_atomic = AtomicU32::new(0);
+    let errors_atomic = AtomicU32::new(0);
+    let foreign_atomic = AtomicU32::new(0);
+    let translated_atomic = AtomicU32::new(0);
+    // Recent paths buffer for the progress JSON. Tiny lock —
+    // contention is bounded to the sub-millisecond push.
+    let recent: Mutex<Vec<String>> = Mutex::new(Vec::with_capacity(8));
+
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(resolved_threads)
+        .thread_name(|i| format!("verify-batch-{i}"))
+        .build()
+        .map_err(|e| VerifyError::InvalidInput(format!("rayon pool: {e}")))?;
+
+    let progress_path_ref = progress_path.as_deref();
+    let target_ref = target;
+
+    let mut results: Vec<BatchFileResult> = pool.install(|| {
+        eligible
+            .par_iter()
+            .map(|(file, kind_label)| {
+                let row = match process_one_file(
+                    file,
+                    kind_label,
+                    target,
+                    ocr_lang,
+                    preset,
+                    backend,
+                    translation_backend,
+                ) {
+                    Ok(r) => {
+                        processed_atomic.fetch_add(1, Ordering::Relaxed);
+                        if r.is_foreign {
+                            foreign_atomic.fetch_add(1, Ordering::Relaxed);
+                        }
+                        if r.translated_text.is_some() {
+                            translated_atomic.fetch_add(1, Ordering::Relaxed);
+                        }
+                        r
+                    }
+                    Err(e) => {
+                        errors_atomic.fetch_add(1, Ordering::Relaxed);
+                        log::warn!("batch: {file:?}: {e}");
+                        BatchFileResult {
+                            file_path: file.to_string_lossy().into_owned(),
+                            input_type: kind_label.to_string(),
+                            detected_language: String::new(),
+                            is_foreign: false,
+                            confidence_tier: String::new(),
+                            confidence_advisory: None,
+                            source_text: None,
+                            translated_text: None,
+                            segments: None,
+                            error: Some(e.to_string()),
+                        }
+                    }
+                };
+
+                // Per-file progress update — best-effort, lock-
+                // protected, never panics back into rayon.
+                if let Some(pp) = progress_path_ref {
+                    if let Ok(mut recent_guard) = recent.lock() {
+                        if recent_guard.len() >= 8 {
+                            recent_guard.remove(0);
+                        }
+                        recent_guard.push(row.file_path.clone());
+                        let snapshot_recent: Vec<String> = recent_guard.clone();
+                        drop(recent_guard);
+                        let _ = write_progress_snapshot(
+                            pp,
+                            target_ref,
+                            total,
+                            processed_atomic.load(Ordering::Relaxed),
+                            foreign_atomic.load(Ordering::Relaxed),
+                            translated_atomic.load(Ordering::Relaxed),
+                            errors_atomic.load(Ordering::Relaxed),
+                            &snapshot_recent,
+                            started.elapsed().as_secs_f64(),
+                        );
+                    }
+                }
+                row
+            })
+            .collect()
+    });
+
+    // par_iter().collect() returns results in the same order as
+    // the input slice (rayon promise) — sort to be defensive.
+    results.sort_by(|a, b| a.file_path.cmp(&b.file_path));
+
+    let processed = processed_atomic.load(Ordering::Relaxed);
+    let errors = errors_atomic.load(Ordering::Relaxed);
+    let foreign_count = foreign_atomic.load(Ordering::Relaxed);
+    let translated_count = translated_atomic.load(Ordering::Relaxed);
 
     let elapsed = started.elapsed().as_secs_f64();
     let mut report = BatchResult {
@@ -1376,8 +1663,23 @@ fn cmd_batch(
     Ok(())
 }
 
+/// Resolve the user-facing `--threads` flag into a concrete pool
+/// size. `0` (the default) → `min(num_cpus, 8)`; any other value
+/// passes through. The 8-thread cap keeps STT model loads (each
+/// pulls ~150 MB of safetensors into memory) from blowing past
+/// reasonable budgets on parallel large-evidence runs.
+fn resolve_thread_count(requested: usize) -> usize {
+    if requested == 0 {
+        std::thread::available_parallelism()
+            .map(|n| n.get().min(8))
+            .unwrap_or(4)
+    } else {
+        requested
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-fn write_progress(
+fn write_progress_snapshot(
     path: &std::path::Path,
     target: &str,
     total: u32,
@@ -1385,18 +1687,13 @@ fn write_progress(
     foreign_count: u32,
     translated_count: u32,
     errors: u32,
-    results: &[BatchFileResult],
+    recent: &[String],
     elapsed_secs: f64,
 ) -> Result<(), VerifyError> {
-    // Lightweight, O(1)-per-file: never copies the full results
-    // vec. Just the counts + the last-3 file paths so an examiner
-    // tailing the file can see live progress.
-    let recent: Vec<&str> = results
-        .iter()
-        .rev()
-        .take(3)
-        .map(|r| r.file_path.as_str())
-        .collect();
+    // Sprint 9 P2 — thread-safe variant of the Sprint 6 progress
+    // writer. The serialisation work happens on the caller's
+    // thread; `recent` is a pre-cloned snapshot so we don't hold
+    // the Mutex across the JSON write.
     let snapshot = serde_json::json!({
         "generated_at": utc_now_iso8601(),
         "target_language": target,
@@ -1806,6 +2103,56 @@ mod tests {
             "x",
         ]);
         assert!(matches!(cli.classifier_backend, ClassifierBackend::Fasttext));
+    }
+
+    #[test]
+    fn resolve_thread_count_zero_means_auto_capped_at_8() {
+        // Default `0` → some positive value, capped at 8.
+        let n = resolve_thread_count(0);
+        assert!(
+            (1..=8).contains(&n),
+            "auto-resolved thread count {n} out of bounds"
+        );
+    }
+
+    #[test]
+    fn resolve_thread_count_passes_through_explicit_value() {
+        // Explicit values pass through — including `1` for forcing
+        // sequential behaviour and large values for power users.
+        assert_eq!(resolve_thread_count(1), 1);
+        assert_eq!(resolve_thread_count(4), 4);
+        assert_eq!(resolve_thread_count(16), 16);
+    }
+
+    #[test]
+    fn parallel_batch_progress_snapshot_is_well_formed() {
+        // Sprint 9 P2 — the threaded progress writer must produce
+        // valid JSON with the MT notice and the recent_files
+        // array, regardless of which worker thread invoked it.
+        let dir = std::env::temp_dir().join(format!(
+            "verify-progress-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rpt.progress.json");
+        let recent = vec!["/ev/a.mp3".to_string(), "/ev/b.mp3".to_string()];
+        write_progress_snapshot(&path, "en", 10, 5, 3, 2, 0, &recent, 12.5)
+            .expect("write");
+        let body = std::fs::read_to_string(&path).expect("read");
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("parse");
+        assert_eq!(parsed["target_language"], "en");
+        assert_eq!(parsed["total_files"], 10);
+        assert_eq!(parsed["processed"], 5);
+        assert!(!parsed["machine_translation_notice"]
+            .as_str()
+            .unwrap_or("")
+            .is_empty());
+        assert_eq!(parsed["recent_files"].as_array().unwrap().len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

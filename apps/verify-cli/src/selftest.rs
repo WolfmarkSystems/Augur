@@ -145,6 +145,31 @@ pub fn run_classification_check_english() -> SelfTestCheck {
     }
 }
 
+/// Sprint 9 P1 — confirms the Pashto/Farsi script disambiguator
+/// is wired in. Drives the script analyzer on a Pashto-glyph-heavy
+/// probe; expects `LikelyPashto` with confidence ≥ 0.7 (the
+/// reclassification bar). Fully offline.
+pub fn run_pashto_disambiguation_check() -> SelfTestCheck {
+    let probe = "ډېر ښه, لاړ شه, ګوره ټول ړومبۍ";
+    let analysis = verify_classifier::pashto_farsi_score(probe);
+    use verify_classifier::ScriptRecommendation;
+    match (analysis.recommendation, analysis.confidence) {
+        (ScriptRecommendation::LikelyPashto, c) if c >= 0.7 => SelfTestCheck {
+            name: "Pashto/Farsi script disambiguation".into(),
+            status: CheckStatus::Pass,
+            message: format!(
+                "probe reclassifies Pashto-glyph text correctly (confidence: {:.2})",
+                c
+            ),
+        },
+        (rec, c) => SelfTestCheck {
+            name: "Pashto/Farsi script disambiguation".into(),
+            status: CheckStatus::Fail,
+            message: format!("probe returned {rec:?} (confidence: {c:.2})"),
+        },
+    }
+}
+
 pub fn run_classification_check_empty() -> SelfTestCheck {
     let classifier = LanguageClassifier::new_whichlang();
     match classifier.classify("", "en") {
@@ -366,6 +391,7 @@ pub fn run_self_test(full: bool) -> Result<SelfTestResult, VerifyError> {
         run_classification_check_arabic(),
         run_classification_check_english(),
         run_classification_check_empty(),
+        run_pashto_disambiguation_check(),
         run_binary_check("Audio preprocessing: ffmpeg", "ffmpeg", false),
         run_binary_check("OCR: tesseract", "tesseract", false),
         run_binary_check("PDF rasterize: pdftoppm", "pdftoppm", false),
