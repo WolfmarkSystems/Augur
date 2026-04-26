@@ -27,6 +27,59 @@ export async function startBatchTranslation(args: {
   return invoke<void>("start_batch_translation", args);
 }
 
+export async function createEvidencePackage(args: {
+  inputPath: string;
+  targetLang: string;
+  caseNumber: string;
+  examinerName: string;
+  agency: string;
+  outputPath: string;
+}): Promise<string> {
+  return invoke<string>("create_evidence_package", args);
+}
+
+export function onPackageFileStart(
+  cb: (p: { file: string; input_type: string; index: number; total: number }) => void,
+): Promise<UnlistenFn> {
+  return listen("package-file-start", (e) => cb(e.payload as never));
+}
+
+export function onPackageFileDone(
+  cb: (p: {
+    file: string;
+    input_type: string;
+    detected_language: string;
+    is_foreign: boolean;
+    translated: boolean;
+    error: string | null;
+    processed: number;
+    total: number;
+  }) => void,
+): Promise<UnlistenFn> {
+  return listen("package-file-done", (e) => cb(e.payload as never));
+}
+
+export function onPackageComplete(
+  cb: (p: {
+    output_path: string;
+    total_files: number;
+    translated_files: number;
+    errors: number;
+    case_number: string;
+    examiner: string;
+    agency: string;
+    size_bytes: number;
+  }) => void,
+): Promise<UnlistenFn> {
+  return listen("package-complete", (e) => cb(e.payload as never));
+}
+
+export function onPackageError(
+  cb: (p: { message: string }) => void,
+): Promise<UnlistenFn> {
+  return listen("package-error", (e) => cb(e.payload as never));
+}
+
 export async function detectFileType(path: string): Promise<string> {
   return invoke<string>("detect_file_type", { path });
 }
@@ -126,6 +179,57 @@ export async function exportReport(args: {
 
 export async function mtAdvisoryText(): Promise<string> {
   return invoke<string>("mt_advisory_text");
+}
+
+// ── Case state (Sprint 16 P2) ───────────────────────────────────
+
+export interface CaseStatePayload {
+  case_number: string;
+  examiner_name: string;
+  agency: string;
+  recent_files: Array<{
+    path: string;
+    opened_at: string;
+    source_lang: string;
+    target_lang: string;
+    file_type: string;
+  }>;
+  last_output_dir: string;
+  flagged_segments: Record<string, unknown[]>;
+}
+
+export async function getCaseState(): Promise<CaseStatePayload> {
+  return invoke<CaseStatePayload>("get_case_state");
+}
+
+export async function setCaseInfo(args: {
+  caseNumber: string;
+  examinerName: string;
+  agency: string;
+}): Promise<void> {
+  return invoke<void>("set_case_info", args);
+}
+
+export async function addRecentFile(args: {
+  path: string;
+  sourceLang: string;
+  targetLang: string;
+  fileType: string;
+}): Promise<void> {
+  return invoke<void>("add_recent_file", args);
+}
+
+export async function saveSegmentFlags(args: {
+  filePath: string;
+  flags: unknown[];
+}): Promise<void> {
+  return invoke<void>("save_segment_flags", args);
+}
+
+export async function getSegmentFlags(args: {
+  filePath: string;
+}): Promise<unknown[]> {
+  return invoke<unknown[]>("get_segment_flags", args);
 }
 
 // ── Pipeline event listeners ────────────────────────────────────

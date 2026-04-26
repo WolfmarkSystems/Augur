@@ -118,6 +118,37 @@ button:disabled {
   font-size: 11px;
 }
 
+.titlebar-case-btn {
+  background: transparent;
+  border: 0;
+  color: var(--c-text-2);
+  font-size: 12px;
+  padding: 2px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.titlebar-case-btn:hover { background: var(--c-bg-3); }
+
+.titlebar-case-btn-empty {
+  color: var(--c-amber);
+  font-style: italic;
+}
+
+.titlebar-file {
+  color: var(--c-text-3);
+  font-size: 12px;
+  margin-left: 6px;
+}
+
+.menu-section-label {
+  font-size: 10px;
+  color: var(--c-text-3);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 6px 12px 2px;
+}
+
 .titlebar-right {
   color: var(--c-text-3);
   font-size: 11px;
@@ -1228,6 +1259,150 @@ button:disabled {
 .statusbar-selftest {
   color: var(--c-amber);
   font-weight: 500;
+}
+
+/* ── Package wizard (Sprint 16 P1) ──────────────────────── */
+
+.pkg-wizard .overlay-body { padding-bottom: 22px; }
+
+.pkg-step h3 {
+  margin: 0 0 12px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--c-text-1);
+}
+
+.pkg-row {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.pkg-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 12px;
+  font-size: 12px;
+}
+
+.pkg-field input {
+  padding: 6px 10px;
+  border: 1px solid var(--c-border-2);
+  border-radius: 6px;
+  background: var(--c-bg-2);
+  color: var(--c-text-1);
+  font-size: 13px;
+}
+
+.pkg-field span {
+  color: var(--c-text-2);
+  font-weight: 500;
+  text-transform: uppercase;
+  font-size: 10px;
+  letter-spacing: 0.05em;
+}
+
+.pkg-hint {
+  font-size: 12px;
+  color: var(--c-text-2);
+  margin: 8px 0;
+}
+
+.pkg-hint code {
+  background: var(--c-bg-3);
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 11px;
+}
+
+.pkg-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 18px;
+}
+
+.pkg-progress-files {
+  max-height: 280px;
+  overflow-y: auto;
+  background: var(--c-bg-2);
+  border-radius: 6px;
+  padding: 8px;
+  margin-bottom: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.pkg-file {
+  display: grid;
+  grid-template-columns: 50px 1fr auto;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 10px;
+  border-radius: 4px;
+  font-size: 12px;
+}
+
+.pkg-file.is-active { background: var(--c-accent-soft); }
+.pkg-file.is-done   { background: rgba(29, 158, 117, 0.06); }
+.pkg-file.is-error  { background: rgba(179, 38, 30, 0.07); }
+
+.pkg-file-idx {
+  color: var(--c-text-3);
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+}
+
+.pkg-file-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pkg-error {
+  background: rgba(179, 38, 30, 0.07);
+  border: 1px solid var(--c-error);
+  color: var(--c-error);
+  padding: 8px 12px;
+  border-radius: 6px;
+  font-size: 12px;
+  margin-bottom: 12px;
+}
+
+.pkg-output-path {
+  background: var(--c-bg-2);
+  border: 0.5px solid var(--c-border-1);
+  border-radius: 6px;
+  padding: 10px 14px;
+  margin: 12px 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  word-break: break-all;
+}
+
+.complete-icon {
+  width: 56px;
+  height: 56px;
+  border-radius: 50%;
+  background: var(--c-accent-soft);
+  color: var(--c-accent-fill);
+  display: grid;
+  place-items: center;
+  font-size: 28px;
+  font-weight: 700;
+  margin: 0 auto 14px;
+}
+
+.mt-advisory {
+  background: var(--c-amber-soft);
+  border: 0.5px solid var(--c-amber);
+  border-radius: 6px;
+  padding: 10px 14px;
+  font-size: 12px;
+  margin: 12px 0 18px;
+  color: var(--c-text-1);
 }
 
 .overlay-panel-wide { width: min(720px, 92vw); }

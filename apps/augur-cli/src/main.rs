@@ -337,6 +337,28 @@ enum Command {
         /// the originals at their canonical location.
         #[arg(long, default_value_t = false)]
         include_originals: bool,
+
+        /// Sprint 16 P1 — case number override. Wins over any
+        /// value in the optional `--config` TOML. Lands in the
+        /// MANIFEST.json `case_number` field and the chain-of-
+        /// custody header.
+        #[arg(long)]
+        case_number: Option<String>,
+
+        /// Sprint 16 P1 — examiner name override.
+        #[arg(long)]
+        examiner: Option<String>,
+
+        /// Sprint 16 P1 — agency override.
+        #[arg(long)]
+        agency: Option<String>,
+
+        /// Sprint 16 P1 — emit per-file packaging progress as
+        /// NDJSON to stdout (`package_file_start` /
+        /// `package_file_done` / `package_complete` events) so
+        /// the desktop GUI can drive a live progress wizard.
+        #[arg(long, default_value = "text")]
+        format_progress: String,
     },
 
     /// Convert a forensic timestamp (Unix / Apple / Windows /
@@ -751,17 +773,32 @@ fn run(
             preset,
             ocr_lang,
             include_originals,
-        } => cmd_package(
-            &input,
-            output.as_deref(),
-            &target,
-            config.as_deref(),
-            preset.into(),
-            &ocr_lang,
-            include_originals,
-            backend,
-            translation_backend,
-        ),
+            case_number,
+            examiner,
+            agency,
+            format_progress,
+        } => {
+            // Sprint 16 P1 — `--format-progress ndjson` activates
+            // the streaming progress channel for the desktop GUI's
+            // Package Wizard.
+            if format_progress.eq_ignore_ascii_case("ndjson") {
+                NDJSON_MODE.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            cmd_package(
+                &input,
+                output.as_deref(),
+                &target,
+                config.as_deref(),
+                preset.into(),
+                &ocr_lang,
+                include_originals,
+                backend,
+                translation_backend,
+                case_number.as_deref(),
+                examiner.as_deref(),
+                agency.as_deref(),
+            )
+        }
         Command::Geoip { ip, input, setup } => cmd_geoip(ip.as_deref(), input.as_deref(), setup),
         Command::Timestamp {
             value,
@@ -1887,6 +1924,9 @@ fn cmd_package(
     include_originals: bool,
     backend: ClassifierBackend,
     translation_backend: TranslationBackend,
+    case_number_override: Option<&str>,
+    examiner_override: Option<&str>,
+    agency_override: Option<&str>,
 ) -> Result<(), AugurError> {
     use std::sync::atomic::{AtomicU32, Ordering};
     use rayon::prelude::*;
@@ -1898,7 +1938,19 @@ fn cmd_package(
         )));
     }
 
-    let config = load_report_config(config_path)?;
+    let mut config = load_report_config(config_path)?;
+    // Sprint 16 P1 — explicit CLI flags win over the optional
+    // TOML config so the desktop GUI can pass case-info per call
+    // without writing a temporary config file.
+    if let Some(c) = case_number_override.filter(|s| !s.is_empty()) {
+        config.case_number = Some(c.to_string());
+    }
+    if let Some(e) = examiner_override.filter(|s| !s.is_empty()) {
+        config.examiner_name = Some(e.to_string());
+    }
+    if let Some(a) = agency_override.filter(|s| !s.is_empty()) {
+        config.agency_name = Some(a.to_string());
+    }
     let zip_path: PathBuf = match output {
         Some(p) => p.to_path_buf(),
         None => {
@@ -1944,11 +1996,29 @@ fn cmd_package(
         .thread_name(|i| format!("augur-package-{i}"))
         .build()
         .map_err(|e| AugurError::InvalidInput(format!("rayon pool: {e}")))?;
+    // Sprint 16 P1 — emit per-file packaging progress when the
+    // global NDJSON_MODE is on (set by `--format-progress ndjson`).
+    let ndjson_progress = NDJSON_MODE.load(std::sync::atomic::Ordering::Relaxed);
+    let started_atomic = AtomicU32::new(0);
+    let total_for_events = eligible.len() as u32;
     let mut results: Vec<BatchFileResult> = pool.install(|| {
         eligible
             .par_iter()
             .map(|(file, kind_label)| {
-                match process_one_file(
+                if ndjson_progress {
+                    let idx = started_atomic.fetch_add(1, Ordering::Relaxed) + 1;
+                    let json = serde_json::json!({
+                        "type": "package_file_start",
+                        "file": file.to_string_lossy(),
+                        "input_type": kind_label,
+                        "index": idx,
+                        "total": total_for_events,
+                    });
+                    println!("{json}");
+                    use std::io::Write;
+                    let _ = std::io::stdout().flush();
+                }
+                let row = match process_one_file(
                     file,
                     kind_label,
                     target,
@@ -1983,7 +2053,24 @@ fn cmd_package(
                             error: Some(e.to_string()),
                         }
                     }
+                };
+                if ndjson_progress {
+                    let json = serde_json::json!({
+                        "type": "package_file_done",
+                        "file": row.file_path,
+                        "input_type": kind_label,
+                        "detected_language": row.detected_language,
+                        "is_foreign": row.is_foreign,
+                        "translated": row.translated_text.is_some(),
+                        "error": row.error,
+                        "processed": processed_atomic.load(Ordering::Relaxed),
+                        "total": total_for_events,
+                    });
+                    println!("{json}");
+                    use std::io::Write;
+                    let _ = std::io::stdout().flush();
                 }
+                row
             })
             .collect()
     });
@@ -2029,6 +2116,23 @@ fn cmd_package(
         println_verify(
             "(originals NOT included — pass --include-originals to bundle source files)",
         );
+    }
+    if ndjson_progress {
+        let json = serde_json::json!({
+            "type": "package_complete",
+            "output_path": zip_path.to_string_lossy(),
+            "total_files": manifest.file_count,
+            "translated_files": manifest.translated_count,
+            "errors": errors,
+            "case_number": config.case_number.clone().unwrap_or_default(),
+            "examiner": config.examiner_name.clone().unwrap_or_default(),
+            "agency": config.agency_name.clone().unwrap_or_default(),
+            "size_bytes": std::fs::metadata(&zip_path).map(|m| m.len()).unwrap_or(0),
+            "machine_translation_notice": MACHINE_TRANSLATION_NOTICE,
+        });
+        println!("{json}");
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
     }
     Ok(())
 }

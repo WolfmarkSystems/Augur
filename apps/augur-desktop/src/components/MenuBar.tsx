@@ -10,16 +10,23 @@ import {
 } from "../ipc";
 import type { FileKind } from "../types";
 
+function shortName(p: string): string {
+  const segs = p.split("/");
+  return segs[segs.length - 1] ?? p;
+}
+
 interface Props {
   onOpenModelManager: () => void;
   onOpenAdvisory: () => void;
   onSetCaseNumber: () => void;
+  onOpenPackageWizard: () => void;
 }
 
 export default function MenuBar({
   onOpenModelManager,
   onOpenAdvisory,
   onSetCaseNumber,
+  onOpenPackageWizard,
 }: Props) {
   const [open, setOpen] = useState<string | null>(null);
   const ref = useRef<HTMLDivElement>(null);
@@ -54,6 +61,8 @@ export default function MenuBar({
   const setError = useAppStore((s) => s.setError);
   const startBatch = useAppStore((s) => s.startBatch);
   const targetLang = useAppStore((s) => s.targetLang);
+  const recentFiles = useAppStore((s) => s.recentFiles);
+  const loadFile = useAppStore((s) => s.loadFile);
 
   const handleOpen = async () => {
     setOpen(null);
@@ -159,6 +168,36 @@ export default function MenuBar({
                     onClick={handleOpenFolder}
                     shortcut="⌘⇧O"
                   />
+                  {recentFiles.length > 0 && (
+                    <>
+                      <div className="menu-divider" />
+                      <div className="menu-section-label">Recent Files</div>
+                      {recentFiles
+                        .slice()
+                        .reverse()
+                        .slice(0, 10)
+                        .map((rf) => (
+                          <Item
+                            key={rf.path}
+                            label={`${shortName(rf.path)}  (${rf.sourceLang} → ${rf.targetLang})`}
+                            onClick={async () => {
+                              setOpen(null);
+                              try {
+                                const meta = await loadFileMetadata(rf.path);
+                                loadFile(
+                                  meta.path,
+                                  meta.name,
+                                  meta.kind as FileKind,
+                                  meta.size_bytes,
+                                );
+                              } catch (err) {
+                                setError(`Could not reopen ${rf.path}: ${String(err)}`);
+                              }
+                            }}
+                          />
+                        ))}
+                    </>
+                  )}
                   <div className="menu-divider" />
                   <Item
                     label="Export Report → HTML"
@@ -171,6 +210,14 @@ export default function MenuBar({
                   <Item
                     label="Export ZIP package"
                     onClick={() => handleExport("zip")}
+                  />
+                  <Item
+                    label="Create Evidence Package…"
+                    onClick={() => {
+                      setOpen(null);
+                      onOpenPackageWizard();
+                    }}
+                    shortcut="⌘E"
                   />
                   <div className="menu-divider" />
                   <Item

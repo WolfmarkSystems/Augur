@@ -59,6 +59,8 @@ export interface AppState {
 
   // Case info
   caseNumber: string;
+  examinerName: string;
+  agency: string;
 
   // Sprint 13 P2 — batch mode
   batch: BatchProgress | null;
@@ -67,6 +69,15 @@ export interface AppState {
   augurAvailable: boolean | null;
   augurBinaryPath: string | null;
   selfTestFails: string[];
+
+  // Sprint 16 P2 — recent files
+  recentFiles: Array<{
+    path: string;
+    openedAt: string;
+    sourceLang: string;
+    targetLang: string;
+    fileType: string;
+  }>;
 
   // View toggles
   showDialectCard: boolean;
@@ -89,6 +100,8 @@ export interface AppState {
   setProgress: (p: number) => void;
   setError: (msg: string | null) => void;
   setCaseNumber: (n: string) => void;
+  setExaminerName: (n: string) => void;
+  setAgency: (n: string) => void;
 
   startBatch: (inputDir: string, outputPath: string, format: "html" | "json" | "csv" | "zip") => void;
   onBatchFileStart: (path: string, inputType: string, total: number) => void;
@@ -104,6 +117,7 @@ export interface AppState {
 
   setAugurAvailable: (v: boolean, path: string | null) => void;
   setSelfTestFails: (fails: string[]) => void;
+  setRecentFiles: (files: AppState["recentFiles"]) => void;
 
   toggleDialectCard: () => void;
   toggleCodeSwitchBands: () => void;
@@ -132,11 +146,14 @@ export const useAppStore = create<AppState>((set) => ({
   errorMessage: null,
 
   caseNumber: "CASE-2026-0001",
+  examinerName: "",
+  agency: "",
 
   batch: null,
   augurAvailable: null,
   augurBinaryPath: null,
   selfTestFails: [],
+  recentFiles: [],
 
   showDialectCard: true,
   showCodeSwitchBands: true,
@@ -189,6 +206,8 @@ export const useAppStore = create<AppState>((set) => ({
   setProgress: (p) => set({ overallProgress: p }),
   setError: (msg) => set({ errorMessage: msg }),
   setCaseNumber: (n) => set({ caseNumber: n }),
+  setExaminerName: (n) => set({ examinerName: n }),
+  setAgency: (n) => set({ agency: n }),
 
   startBatch: (inputDir, outputPath, format) =>
     set({
@@ -272,6 +291,7 @@ export const useAppStore = create<AppState>((set) => ({
   setAugurAvailable: (v, path) =>
     set({ augurAvailable: v, augurBinaryPath: path }),
   setSelfTestFails: (fails) => set({ selfTestFails: fails }),
+  setRecentFiles: (files) => set({ recentFiles: files }),
 
   toggleDialectCard: () =>
     set((s) => ({ showDialectCard: !s.showDialectCard })),

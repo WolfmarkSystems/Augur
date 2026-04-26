@@ -8,11 +8,15 @@ import WorkspaceDoc from "./components/WorkspaceDoc";
 import WorkspaceAudio from "./components/WorkspaceAudio";
 import WorkspaceBatch from "./components/WorkspaceBatch";
 import ModelManager from "./components/ModelManager";
+import PackageWizard from "./components/PackageWizard";
 import ErrorBanner, { type ErrorBannerType } from "./components/ErrorBanner";
 import { invoke } from "@tauri-apps/api/core";
 import {
+  addRecentFile,
   augurBinaryPath,
   checkAugurAvailable,
+  getCaseState,
+  setCaseInfo,
   mtAdvisoryText,
   onBatchComplete,
   onBatchError,
@@ -55,11 +59,17 @@ export default function App() {
   const augurAvailable = useAppStore((s) => s.augurAvailable);
 
   const [showModelManager, setShowModelManager] = useState(false);
+  const [showPackageWizard, setShowPackageWizard] = useState(false);
   const [showAdvisory, setShowAdvisory] = useState(false);
   const [advisoryText, setAdvisoryText] = useState<string>(MT_ADVISORY_FALLBACK);
   const [bannerType, setBannerType] = useState<ErrorBannerType | null>(null);
   const [bannerMessage, setBannerMessage] = useState<string | undefined>();
   const setSelfTestFailsStore = useAppStore((s) => s.setSelfTestFails);
+  const examinerName = useAppStore((s) => s.examinerName);
+  const agency = useAppStore((s) => s.agency);
+  const setExaminerStore = useAppStore((s) => s.setExaminerName);
+  const setAgencyStore = useAppStore((s) => s.setAgency);
+  const setRecentFiles = useAppStore((s) => s.setRecentFiles);
 
   // Subscribe to pipeline events once on mount.
   useEffect(() => {
@@ -159,6 +169,25 @@ export default function App() {
     mtAdvisoryText()
       .then((t) => setAdvisoryText(t))
       .catch(() => setAdvisoryText(MT_ADVISORY_FALLBACK));
+    // Sprint 16 P2 — restore persistent case state.
+    getCaseState()
+      .then((s) => {
+        if (s.case_number) setCaseNumber(s.case_number);
+        if (s.examiner_name) setExaminerStore(s.examiner_name);
+        if (s.agency) setAgencyStore(s.agency);
+        setRecentFiles(
+          s.recent_files.map((r) => ({
+            path: r.path,
+            openedAt: r.opened_at,
+            sourceLang: r.source_lang,
+            targetLang: r.target_lang,
+            fileType: r.file_type,
+          })),
+        );
+      })
+      .catch(() => {
+        // No on-disk case state yet; keep defaults.
+      });
     return () => unlisten.forEach((u) => u());
   }, [
     addSegment,
@@ -173,11 +202,47 @@ export default function App() {
     onBatchCompleteStore,
     setAugurAvailable,
     setSelfTestFailsStore,
+    setCaseNumber,
+    setExaminerStore,
+    setAgencyStore,
+    setRecentFiles,
   ]);
 
-  // Whenever a new file is loaded, kick off translation.
+  // Sprint 16 P2 — persist case info changes to disk.
+  useEffect(() => {
+    setCaseInfo({
+      caseNumber,
+      examinerName,
+      agency,
+    }).catch(() => {
+      // Disk persistence failure is non-fatal — surface only
+      // through logs, not a banner.
+    });
+  }, [caseNumber, examinerName, agency]);
+
+  // Whenever a new file is loaded, kick off translation +
+  // record it in the persistent recent-files list.
   useEffect(() => {
     if (!loadedFile) return;
+    addRecentFile({
+      path: loadedFile,
+      sourceLang: sourceLang.code,
+      targetLang: targetLang.code,
+      fileType: fileType ?? "document",
+    })
+      .then(() => getCaseState())
+      .then((s) =>
+        setRecentFiles(
+          s.recent_files.map((r) => ({
+            path: r.path,
+            openedAt: r.opened_at,
+            sourceLang: r.source_lang,
+            targetLang: r.target_lang,
+            fileType: r.file_type,
+          })),
+        ),
+      )
+      .catch(() => {});
     resetTranslation();
     setIsTranslating(true);
     setActiveEngine(engine === "auto" ? "nllb-600m" : engine);
@@ -218,6 +283,7 @@ export default function App() {
       <MenuBar
         onOpenModelManager={() => setShowModelManager(true)}
         onOpenAdvisory={() => setShowAdvisory(true)}
+        onOpenPackageWizard={() => setShowPackageWizard(true)}
         onSetCaseNumber={() => {
           const next = window.prompt(
             "Case number for exports and chain of custody:",
@@ -268,6 +334,11 @@ export default function App() {
       <ModelManager
         open={showModelManager}
         onClose={() => setShowModelManager(false)}
+      />
+
+      <PackageWizard
+        open={showPackageWizard}
+        onClose={() => setShowPackageWizard(false)}
       />
 
       {showAdvisory && (

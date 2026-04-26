@@ -225,6 +225,116 @@ async fn pump_translation(app: &AppHandle, mut cmd: Command) -> Result<(), Strin
 
 /// Re-shape the CLI's snake_case `segment` event into the
 /// camelCase shape the React side has consumed since Sprint 12.
+/// Sprint 16 P1 — drive `augur package` from the GUI's Package
+/// Wizard. Streams `package_file_start` / `package_file_done` /
+/// `package_complete` events to the front-end. Returns the
+/// resolved output path on success — useful for the wizard's
+/// "Open in Finder" affordance.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn create_evidence_package(
+    app: AppHandle,
+    input_path: String,
+    target_lang: String,
+    case_number: String,
+    examiner_name: String,
+    agency: String,
+    output_path: String,
+) -> Result<String, String> {
+    let augur = find_augur_binary()
+        .ok_or_else(|| "AUGUR CLI not found.".to_string())?;
+    if !PathBuf::from(&input_path).exists() {
+        return Err(format!("evidence path does not exist: {input_path}"));
+    }
+    let mut cmd = Command::new(&augur);
+    cmd.arg("package")
+        .arg("--input")
+        .arg(&input_path)
+        .arg("--target")
+        .arg(&target_lang)
+        .arg("--output")
+        .arg(&output_path)
+        .arg("--format-progress")
+        .arg("ndjson");
+    if !case_number.is_empty() {
+        cmd.arg("--case-number").arg(&case_number);
+    }
+    if !examiner_name.is_empty() {
+        cmd.arg("--examiner").arg(&examiner_name);
+    }
+    if !agency.is_empty() {
+        cmd.arg("--agency").arg(&agency);
+    }
+    cmd.stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let app_for_task = app.clone();
+    let output_for_return = output_path.clone();
+    tokio::spawn(async move {
+        if let Err(e) = pump_package(&app_for_task, cmd).await {
+            let _ = app_for_task.emit(
+                "package-error",
+                serde_json::json!({"message": e}),
+            );
+        }
+    });
+    Ok(output_for_return)
+}
+
+async fn pump_package(app: &AppHandle, mut cmd: Command) -> Result<(), String> {
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("Failed to start AUGUR package: {e}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "no stdout from AUGUR package".to_string())?;
+    let mut lines = BufReader::new(stdout).lines();
+    while let Some(line) = lines
+        .next_line()
+        .await
+        .map_err(|e| format!("read stdout: {e}"))?
+    {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let json: Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!("non-JSON package line: {line:?} ({e})");
+                continue;
+            }
+        };
+        match json
+            .get("type")
+            .and_then(|t| t.as_str())
+            .unwrap_or_default()
+        {
+            "package_file_start" => {
+                let _ = app.emit("package-file-start", &json);
+            }
+            "package_file_done" => {
+                let _ = app.emit("package-file-done", &json);
+            }
+            "package_complete" => {
+                let _ = app.emit("package-complete", &json);
+                break;
+            }
+            other => log::warn!("unknown package event type: {other:?}"),
+        }
+    }
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| format!("wait for AUGUR package: {e}"))?;
+    if !status.success() {
+        let _ = app.emit(
+            "package-error",
+            serde_json::json!({"message": format!("AUGUR package exited with {status}")}),
+        );
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn start_batch_translation(
     app: AppHandle,

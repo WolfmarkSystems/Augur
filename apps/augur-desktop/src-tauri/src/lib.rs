@@ -4,6 +4,7 @@
 //! cargo workspace. Build:
 //!   cd apps/augur-desktop/src-tauri && cargo build
 
+pub mod case_state;
 pub mod export;
 pub mod file_load;
 pub mod models;
@@ -28,12 +29,18 @@ pub fn run() {
             models::install_model,
             pipeline::start_translation,
             pipeline::start_batch_translation,
+            pipeline::create_evidence_package,
             pipeline::check_augur_available,
             pipeline::augur_binary_path,
             pipeline::run_startup_self_test,
             export::save_report_dialog,
             export::export_report,
             export::mt_advisory_text,
+            case_state::get_case_state,
+            case_state::set_case_info,
+            case_state::add_recent_file,
+            case_state::save_segment_flags,
+            case_state::get_segment_flags,
         ])
         .run(tauri::generate_context!())
         .expect("AUGUR Desktop failed to launch");
