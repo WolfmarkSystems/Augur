@@ -60,6 +60,19 @@ pub struct ClassificationResult {
     /// ambiguity), this carries the human-readable note.
     /// `None` when no disambiguation step ran.
     pub disambiguation_note: Option<String>,
+    /// Super Sprint Group A — coarse Arabic dialect family,
+    /// populated when `language == "ar"`. `None` for any other
+    /// detected language.
+    pub arabic_dialect: Option<crate::ArabicDialect>,
+    /// Confidence in the dialect call, 0.0–1.0. `0.0` when no
+    /// dialect step ran.
+    pub arabic_dialect_confidence: f32,
+    /// Words that triggered the dialect call (for examiner
+    /// display). Empty list when no dialect step ran.
+    pub arabic_dialect_indicators: Vec<String>,
+    /// Human-readable dialect advisory. `None` when no
+    /// dialect step ran.
+    pub arabic_dialect_note: Option<String>,
 }
 
 /// Confidence tier for an LID classification. Sprint 6 P2 —
@@ -155,6 +168,10 @@ impl ClassificationResult {
             input_word_count: 0,
             advisory: None,
             disambiguation_note: None,
+            arabic_dialect: None,
+            arabic_dialect_confidence: 0.0,
+            arabic_dialect_indicators: Vec::new(),
+            arabic_dialect_note: None,
         }
     }
 }
@@ -395,6 +412,29 @@ impl LanguageClassifier {
         let tier = classify_confidence(confidence, input_word_count);
         let advisory = confidence_advisory(tier, input_word_count);
 
+        // Super Sprint Group A — Arabic dialect detection.
+        // Only fires when the LID layer concluded `ar`; any
+        // other language (or a `fa→ps` reclassification) skips
+        // it.
+        let (arabic_dialect, arabic_dialect_confidence,
+             arabic_dialect_indicators, arabic_dialect_note) =
+            if final_language == "ar" {
+                let analysis = crate::detect_arabic_dialect(text);
+                let note = if analysis.advisory.is_empty() {
+                    None
+                } else {
+                    Some(analysis.advisory)
+                };
+                (
+                    Some(analysis.detected_dialect),
+                    analysis.confidence,
+                    analysis.indicator_words,
+                    note,
+                )
+            } else {
+                (None, 0.0, Vec::new(), None)
+            };
+
         Ok(ClassificationResult {
             is_foreign: !final_language.is_empty()
                 && final_language != target_language,
@@ -405,6 +445,10 @@ impl LanguageClassifier {
             input_word_count,
             advisory,
             disambiguation_note,
+            arabic_dialect,
+            arabic_dialect_confidence,
+            arabic_dialect_indicators,
+            arabic_dialect_note,
         })
     }
 }
@@ -677,6 +721,10 @@ mod tests {
             input_word_count: 4,
             advisory: None,
             disambiguation_note: note,
+            arabic_dialect: None,
+            arabic_dialect_confidence: 0.0,
+            arabic_dialect_indicators: Vec::new(),
+            arabic_dialect_note: None,
         };
         assert_eq!(r.language, "ps");
         assert!(r.disambiguation_note.is_some());

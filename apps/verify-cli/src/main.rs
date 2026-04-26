@@ -5,6 +5,7 @@
 //! fastText or whichlang) plus Sprint-1 stubs for STT and
 //! translation; Sprint 2 replaces the stubs.
 
+mod benchmark;
 mod package;
 mod selftest;
 
@@ -14,13 +15,17 @@ use std::process::ExitCode;
 use verify_classifier::{LanguageClassifier, ModelManager as ClassifierModelManager};
 use verify_core::geoip::{GeoIpEngine, GeoIpResult, GEOIP_DB_INSTRUCTIONS};
 use verify_core::report::{render_batch_html, ReportConfig};
+use verify_core::yara_scan::{YaraEngine, YaraMatch};
 use verify_core::timestamps::{
     convert as ts_convert, detect_and_convert as ts_detect, parse_input_file as ts_parse,
     TimestampFormat, TimestampResult,
 };
 use verify_core::pipeline::{
-    detect_input_kind, render_batch_csv, BatchFileResult, BatchResult, BatchSegment,
+    detect_input_kind_robust, render_batch_csv, BatchFileResult, BatchResult, BatchSegment,
     PipelineInput,
+};
+use verify_core::subtitle::{
+    parse_srt, parse_vtt, render_srt as render_srt_subs, SubtitleEntry,
 };
 use verify_core::VerifyError;
 use verify_ocr::{extract_pdf_text, iso_to_tesseract, OcrEngine};
@@ -190,6 +195,23 @@ enum Command {
         #[arg(long, value_enum, default_value_t = CliPreset::Balanced)]
         preset: CliPreset,
 
+        /// Super Sprint Group B P3 — path to a YARA rules file
+        /// (or directory). When set, the translated text AND the
+        /// original source are scanned with the rules; matches
+        /// are printed alongside the translation.
+        /// Requires `yara` on PATH.
+        #[arg(long)]
+        yara_rules: Option<PathBuf>,
+
+        /// Super Sprint Group B P2 — when the input is a subtitle
+        /// file (.srt / .vtt), write a translated subtitle file
+        /// to this path. Cues retain their original timestamps;
+        /// only the cue text is replaced with the NLLB output.
+        /// Output format mirrors the input (`.srt` → SRT,
+        /// `.vtt` → SRT regardless — most players read SRT).
+        #[arg(long)]
+        output_srt: Option<PathBuf>,
+
         /// Enable speaker diarization (who said what). Requires
         /// `pip3 install --user pyannote.audio` and a Hugging Face
         /// token configured via `verify setup --hf-token`. Audio
@@ -197,6 +219,41 @@ enum Command {
         /// unaffected. Default: off.
         #[arg(long, default_value_t = false)]
         diarize: bool,
+    },
+
+    /// Show bundled VERIFY documentation. Without a topic
+    /// argument prints the full user manual; with one of
+    /// `quick`, `deploy`, `airgap`, `strata`, `languages`,
+    /// prints the focused doc.
+    Docs {
+        /// Optional topic. One of `manual` (default) / `quick` /
+        /// `deploy` / `airgap` / `strata` / `languages`.
+        topic: Option<String>,
+    },
+
+    /// Run the VERIFY benchmark suite. By default exercises the
+    /// classifier on every text fixture under `tests/benchmarks/`.
+    /// `--full` adds a translation pass on the smallest fixture
+    /// (requires the python NLLB worker dependencies).
+    Benchmark {
+        /// Path to the fixtures directory. Defaults to
+        /// `tests/benchmarks/` relative to the workspace root.
+        #[arg(long)]
+        fixtures: Option<PathBuf>,
+
+        /// Optional output JSON path.
+        #[arg(long)]
+        output: Option<PathBuf>,
+
+        /// Compare against a previously-written results JSON;
+        /// any fixture > 1.2× the baseline is flagged.
+        #[arg(long)]
+        compare: Option<PathBuf>,
+
+        /// Run translation benchmarks too. Without it the run
+        /// is fully offline.
+        #[arg(long, default_value_t = false)]
+        full: bool,
     },
 
     /// Build an evidence-export ZIP from a previously-run batch
@@ -494,7 +551,9 @@ fn run(
             ocr_lang,
             target,
             preset,
+            output_srt,
             diarize,
+            yara_rules,
         } => cmd_translate(
             input.as_deref(),
             text.as_deref(),
@@ -505,8 +564,17 @@ fn run(
             backend,
             translation_backend,
             diarize,
+            output_srt.as_deref(),
+            yara_rules.as_deref(),
         ),
         Command::Setup { hf_token } => cmd_setup(&hf_token),
+        Command::Docs { topic } => cmd_docs(topic.as_deref()),
+        Command::Benchmark {
+            fixtures,
+            output,
+            compare,
+            full,
+        } => cmd_benchmark(fixtures.as_deref(), output.as_deref(), compare.as_deref(), full),
         Command::SelfTest { full } => cmd_self_test(full),
         Command::Package {
             input,
@@ -603,6 +671,24 @@ fn print_classification(r: &verify_classifier::ClassificationResult) {
     if let Some(note) = &r.disambiguation_note {
         println_verify(format!("         ⚠ {note}"));
     }
+    if let Some(dialect) = r.arabic_dialect {
+        if !matches!(dialect, verify_classifier::ArabicDialect::Unknown) {
+            println_verify(format!(
+                "         Dialect: {} — confidence {:.2}",
+                dialect.as_str(),
+                r.arabic_dialect_confidence
+            ));
+            if !r.arabic_dialect_indicators.is_empty() {
+                println_verify(format!(
+                    "         Dialect indicators: {}",
+                    r.arabic_dialect_indicators.join(", ")
+                ));
+            }
+            if let Some(note) = &r.arabic_dialect_note {
+                println_verify(format!("         ⚠ {note}"));
+            }
+        }
+    }
 }
 
 // ── transcribe ───────────────────────────────────────────────────
@@ -687,13 +773,16 @@ fn cmd_translate(
     backend: ClassifierBackend,
     translation_backend: TranslationBackend,
     diarize: bool,
+    output_srt: Option<&std::path::Path>,
+    yara_rules: Option<&std::path::Path>,
 ) -> Result<(), VerifyError> {
     // Resolve the source text through the appropriate engine. The
     // pipelines diverge here:
-    //   audio → preprocess → STT → classifier → NLLB
-    //   video → ffmpeg-extract → STT → classifier → NLLB
-    //   image → OCR → classifier → NLLB
-    //   text  → classifier → NLLB
+    //   audio    → preprocess → STT → classifier → NLLB
+    //   video    → ffmpeg-extract → STT → classifier → NLLB
+    //   image    → OCR → classifier → NLLB
+    //   subtitle → SRT/VTT parse → classifier → per-cue NLLB
+    //   text     → classifier → NLLB
     let resolved_path: Option<std::path::PathBuf> = input.map(|p| p.to_path_buf());
     let resolved = match (input, text, image) {
         (Some(path), None, None) => resolve_path_input(path, preset)?,
@@ -858,6 +947,126 @@ fn cmd_translate(
     } else {
         print_translation(&translation);
     }
+
+    // Super Sprint Group B P3 — YARA pattern scanning. Scan
+    // the translated text AND the source text; print matches.
+    if let Some(rules) = yara_rules {
+        run_yara_scans(
+            rules,
+            &resolved.text,
+            translation.translated_text.as_str(),
+        )?;
+    }
+
+    // Super Sprint Group B P2 — per-cue translated SRT output.
+    // Only fires when the input was a subtitle file AND the
+    // user passed `--output-srt`. We re-parse the entries (cheap
+    // — already on disk) and translate each cue independently,
+    // preserving timestamps. The full-text translation above
+    // remains the human-facing summary.
+    if matches!(resolved.kind_label, "subtitle") {
+        if let Some(out_path) = output_srt {
+            if let Some(in_path) = resolved_path.as_deref() {
+                println_verify(format!(
+                    "Writing translated SRT to {out_path:?} (per-cue NLLB)..."
+                ));
+                write_translated_srt(in_path, out_path, &lang, target, translation_backend)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn run_yara_scans(
+    rules: &std::path::Path,
+    source_text: &str,
+    translated_text: &str,
+) -> Result<(), VerifyError> {
+    let engine = YaraEngine::load(rules)?;
+    if !engine.is_available() {
+        println_verify(
+            "⚠ YARA scan skipped — `yara` binary not on PATH. \
+             Install with `brew install yara` or `apt install yara`.",
+        );
+        return Ok(());
+    }
+    let mut all: Vec<YaraMatch> = Vec::new();
+    if !translated_text.trim().is_empty() {
+        match engine.scan_text(translated_text) {
+            Ok(mut hits) => {
+                for h in &mut hits {
+                    h.scanned_source = "translation".to_string();
+                }
+                all.extend(hits);
+            }
+            Err(e) => {
+                log::warn!("YARA scan (translation) failed: {e}");
+            }
+        }
+    }
+    if !source_text.trim().is_empty() {
+        match engine.scan_text(source_text) {
+            Ok(mut hits) => {
+                for h in &mut hits {
+                    h.scanned_source = "source".to_string();
+                }
+                all.extend(hits);
+            }
+            Err(e) => {
+                log::warn!("YARA scan (source) failed: {e}");
+            }
+        }
+    }
+    if all.is_empty() {
+        println_verify("YARA scan: 0 matches.");
+    } else {
+        println_verify(format!("YARA scan: {} match(es)", all.len()));
+        for m in &all {
+            println_verify(format!("  Rule: {} ({})", m.rule_name, m.scanned_source));
+            for s in &m.matched_strings {
+                let preview: String = s.data.chars().take(80).collect();
+                println_verify(format!(
+                    "    ${} @ 0x{:x}: {preview}",
+                    s.identifier, s.offset
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn write_translated_srt(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    source_lang: &str,
+    target_lang: &str,
+    translation_backend: TranslationBackend,
+) -> Result<(), VerifyError> {
+    let mut entries = load_subtitle_entries(src)?;
+    if source_lang == target_lang {
+        // Nothing to translate — just copy text through.
+        let body = render_srt_subs(&entries);
+        std::fs::write(dst, body)?;
+        return Ok(());
+    }
+    let mut engine = TranslationEngine::with_xdg_cache()?;
+    engine.backend = translation_backend;
+    for entry in &mut entries {
+        if entry.text.trim().is_empty() {
+            continue;
+        }
+        let result = engine.translate(&entry.text, source_lang, target_lang)?;
+        // Forensic invariant — every TranslationResult carries
+        // the MT advisory; we don't strip it but we don't write
+        // it into the cue body either (cues are user-visible).
+        // The advisory belongs in the report, not on every line
+        // of every subtitle.
+        debug_assert!(result.is_machine_translation);
+        debug_assert!(!result.advisory_notice.is_empty());
+        entry.text = result.translated_text;
+    }
+    std::fs::write(dst, render_srt_subs(&entries))?;
     Ok(())
 }
 
@@ -931,6 +1140,99 @@ fn best_speaker(start_ms: u64, end_ms: u64, diar: &[DiarizationSegment]) -> Stri
         .unwrap_or_else(|| "UNKNOWN".to_string())
 }
 
+// Bundled docs — `include_str!` so `verify docs` works on
+// air-gapped machines that don't have the source tree.
+const DOCS_USER_MANUAL: &str = include_str!("../../../docs/USER_MANUAL.md");
+const DOCS_QUICK_REFERENCE: &str = include_str!("../../../docs/QUICK_REFERENCE.md");
+const DOCS_DEPLOYMENT: &str = include_str!("../../../docs/DEPLOYMENT.md");
+const DOCS_AIRGAP: &str = include_str!("../../../docs/AIRGAP_INSTALL.md");
+const DOCS_STRATA: &str = include_str!("../../../docs/STRATA_INTEGRATION.md");
+const DOCS_LANG_LIMITS: &str = include_str!("../../../docs/LANGUAGE_LIMITATIONS.md");
+
+fn cmd_docs(topic: Option<&str>) -> Result<(), VerifyError> {
+    let body = match topic.unwrap_or("manual") {
+        "manual" | "user" | "" => DOCS_USER_MANUAL,
+        "quick" | "ref" | "reference" => DOCS_QUICK_REFERENCE,
+        "deploy" | "deployment" => DOCS_DEPLOYMENT,
+        "airgap" | "air-gap" => DOCS_AIRGAP,
+        "strata" => DOCS_STRATA,
+        "languages" | "limits" | "limitations" => DOCS_LANG_LIMITS,
+        other => {
+            return Err(VerifyError::InvalidInput(format!(
+                "unknown docs topic {other:?}; valid: manual, quick, deploy, airgap, strata, languages"
+            )));
+        }
+    };
+    // Print docs through the same `println_verify` helper that
+    // every other CLI line uses — keeping every stdout write
+    // routed through one auditable function. The `[VERIFY]`
+    // prefix is consistent across the binary even on doc
+    // output; piping `verify docs | sed 's/^\[VERIFY\] //'`
+    // strips it for human reading.
+    for line in body.lines() {
+        println_verify(line);
+    }
+    Ok(())
+}
+
+fn cmd_benchmark(
+    fixtures: Option<&std::path::Path>,
+    output: Option<&std::path::Path>,
+    compare: Option<&std::path::Path>,
+    full: bool,
+) -> Result<(), VerifyError> {
+    let fixtures_dir = match fixtures {
+        Some(p) => p.to_path_buf(),
+        None => {
+            // Default: workspace_root/tests/benchmarks. Resolve
+            // from CARGO_MANIFEST_DIR at compile time so the
+            // installed binary keeps working when the workspace
+            // is co-located.
+            let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            p.push("../../tests/benchmarks");
+            p.canonicalize().unwrap_or(p)
+        }
+    };
+    let opts = benchmark::BenchmarkOptions {
+        full,
+        fixtures_dir,
+    };
+    let suite = benchmark::run_suite(&opts)?;
+    for line in benchmark::render_text(&suite).lines() {
+        println_verify(line);
+    }
+    if let Some(prev_path) = compare {
+        let body = std::fs::read_to_string(prev_path)?;
+        let baseline: benchmark::BenchmarkSuite = serde_json::from_str(&body)
+            .map_err(|e| {
+                VerifyError::InvalidInput(format!(
+                    "previous benchmark JSON parse: {e}"
+                ))
+            })?;
+        let report = benchmark::render_regression_report(&suite, &baseline);
+        if report.is_empty() {
+            println_verify("Regression check: no slowdowns > 1.2× baseline detected.");
+        } else {
+            for line in report.lines() {
+                println_verify(line);
+            }
+        }
+    }
+    if let Some(out) = output {
+        let body = serde_json::to_string_pretty(&suite).map_err(|e| {
+            VerifyError::InvalidInput(format!("benchmark JSON serialise: {e}"))
+        })?;
+        if let Some(parent) = out.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        std::fs::write(out, body)?;
+        println_verify(format!("Results saved: {out:?}"));
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cmd_package(
     input: &std::path::Path,
@@ -977,12 +1279,13 @@ fn cmd_package(
     files.sort();
     let mut eligible: Vec<(PathBuf, &'static str)> = Vec::with_capacity(files.len());
     for f in &files {
-        let kind = detect_input_kind(f);
+        let kind = detect_input_kind_robust(f);
         let label: &'static str = match &kind {
             PipelineInput::Audio(_) => "audio",
             PipelineInput::Video(_) => "video",
             PipelineInput::Image(_) => "image",
             PipelineInput::Pdf(_) => "pdf",
+            PipelineInput::Subtitle(_) => "subtitle",
             PipelineInput::Text(_) => "text",
         };
         eligible.push((f.clone(), label));
@@ -1283,7 +1586,7 @@ fn resolve_path_input(
             "input file not found: {path:?}"
         )));
     }
-    match detect_input_kind(path) {
+    match detect_input_kind_robust(path) {
         PipelineInput::Video(p) => {
             let scratch = std::env::temp_dir().join("verify").join("video-scratch");
             println_verify("Input type: Video — extracting audio track via ffmpeg...");
@@ -1332,6 +1635,10 @@ fn resolve_path_input(
             println_verify("Input type: PDF — extracting text layer (OCR fallback if scanned)...");
             resolve_pdf_input(&p, "en")
         }
+        PipelineInput::Subtitle(p) => {
+            println_verify(format!("Input type: Subtitle ({:?})", p.extension()));
+            resolve_subtitle_input(&p)
+        }
         PipelineInput::Text(_) => {
             // detect_input_kind never returns Text from a path —
             // it falls back to Audio. This arm exists only to keep
@@ -1340,6 +1647,44 @@ fn resolve_path_input(
                 "text input must be passed via --text, not --input".to_string(),
             ))
         }
+    }
+}
+
+/// Sprint Group B P2 — parse `.srt`/`.vtt` into a string the
+/// classifier can chew on. The CLI keeps the parsed entries
+/// alongside (read separately when `--output-srt` is set) via
+/// [`load_subtitle_entries`]; here we just produce a
+/// concatenation for classification purposes.
+fn resolve_subtitle_input(path: &std::path::Path) -> Result<ResolvedSource, VerifyError> {
+    let entries = load_subtitle_entries(path)?;
+    let text = entries
+        .iter()
+        .map(|e| e.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    Ok(ResolvedSource {
+        text,
+        upstream_lang: String::new(),
+        upstream_confidence: 0.0,
+        segments: None,
+        kind_label: "subtitle",
+        audio_path: None,
+        audio_path_is_scratch: false,
+    })
+}
+
+fn load_subtitle_entries(path: &std::path::Path) -> Result<Vec<SubtitleEntry>, VerifyError> {
+    let body = std::fs::read_to_string(path)?;
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase());
+    match ext.as_deref() {
+        Some("srt") => parse_srt(&body),
+        Some("vtt") => parse_vtt(&body),
+        other => Err(VerifyError::InvalidInput(format!(
+            "subtitle input expects .srt/.vtt; got {other:?}"
+        ))),
     }
 }
 
@@ -1455,16 +1800,19 @@ fn cmd_batch(
     let mut video_count = 0u32;
     let mut image_count = 0u32;
     let mut pdf_count = 0u32;
+    let mut subtitle_count = 0u32;
     let mut other_count = 0u32;
     for f in &files {
-        match detect_input_kind(f) {
+        match detect_input_kind_robust(f) {
             PipelineInput::Audio(_) => audio_count += 1,
             PipelineInput::Video(_) => video_count += 1,
             PipelineInput::Image(_) => image_count += 1,
             PipelineInput::Pdf(_) => pdf_count += 1,
+            PipelineInput::Subtitle(_) => subtitle_count += 1,
             PipelineInput::Text(_) => other_count += 1,
         }
     }
+    let _ = subtitle_count; // surfaced via the per-file dispatch below
     println_verify(format!("Batch processing: {input:?}"));
     println_verify(format!(
         "Found {} files ({audio_count} audio, {video_count} video, {image_count} image, \
@@ -1500,12 +1848,13 @@ fn cmd_batch(
     // call `detect_input_kind` twice.
     let mut eligible: Vec<(PathBuf, &'static str)> = Vec::with_capacity(files.len());
     for file in &files {
-        let kind = detect_input_kind(file);
+        let kind = detect_input_kind_robust(file);
         let kind_label: &'static str = match &kind {
             PipelineInput::Audio(_) => "audio",
             PipelineInput::Video(_) => "video",
             PipelineInput::Image(_) => "image",
             PipelineInput::Pdf(_) => "pdf",
+            PipelineInput::Subtitle(_) => "subtitle",
             PipelineInput::Text(_) => "text",
         };
         if let Some(allow) = &allowed {
@@ -1886,6 +2235,7 @@ fn process_one_file(
         "audio" | "video" => resolve_path_input(file, preset)?,
         "image" => resolve_image_input(file, ocr_lang)?,
         "pdf" => resolve_pdf_input(file, ocr_lang)?,
+        "subtitle" => resolve_subtitle_input(file)?,
         other => {
             return Err(VerifyError::InvalidInput(format!(
                 "batch: unsupported input kind {other:?} for {file:?}"

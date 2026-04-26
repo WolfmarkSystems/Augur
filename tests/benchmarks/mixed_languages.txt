@@ -1,0 +1,1 @@
+This is an English message followed by Arabic content. مرحبا بالعالم، هذا نص عربي مختلط مع الإنجليزية. Then back to English. كيف حالك اليوم؟ Doing well, thanks. شكرا لك.

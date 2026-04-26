@@ -13,6 +13,9 @@ pub mod error;
 pub mod geoip;
 pub mod pipeline;
 pub mod report;
+pub mod resilience;
+pub mod subtitle;
 pub mod timestamps;
+pub mod yara_scan;
 
 pub use error::VerifyError;

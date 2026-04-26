@@ -574,6 +574,77 @@ opt-in API.
   Forensic chain-of-custody text always includes the MT
   notice in prose.
 
+## Super Sprint decisions (shipped 2026-04-26)
+
+- **Group A — Arabic dialect detection.** New
+  `verify_classifier::arabic_dialect` module: `ArabicDialect`
+  enum (Modern Standard, Egyptian, Levantine, Gulf, Iraqi,
+  Moroccan, Yemeni, Sudanese, Unknown) +
+  `detect_arabic_dialect(text)` lexical-marker scorer.
+  ClassificationResult gains `arabic_dialect`,
+  `arabic_dialect_confidence`, `arabic_dialect_indicators`,
+  `arabic_dialect_note`. The detector is intentionally
+  conservative — needs ≥ 2 distinctive markers to make a
+  confident call; one marker degrades to `Unknown`. The
+  forensic advisory always tells the examiner to verify
+  dialect calls with a human linguist.
+- **Group B P2 — SRT/VTT subtitle support.** New
+  `verify_core::subtitle` module: `SubtitleEntry`,
+  `parse_srt`, `parse_vtt`, `render_srt`, `render_vtt`,
+  timestamp helpers. `PipelineInput::Subtitle` routed by
+  extension. CLI flag `verify translate --output-srt <path>`
+  re-runs translation per cue and writes a media-player-ready
+  translated SRT, preserving the original timestamps.
+- **Group B P3 — YARA pattern integration (subprocess).** New
+  `verify_core::yara_scan` module wraps the `yara` CLI binary
+  (same pattern as `ffmpeg`/`tesseract`). New
+  `VerifyError::Yara` + `VerifyError::YaraNotInstalled`
+  variants. Built-in starter rules at
+  `data/yara_rules/starter.yar` (BTC / ETH wallets, URLs,
+  Tor onion addresses, phone numbers, emails, IPv4). CLI
+  flag `--yara-rules <path>` on `verify translate` scans
+  both translated and original text. Subprocess approach
+  avoids the libyara system dep.
+- **Group C P4 — error recovery.** New
+  `verify_core::resilience` module: `PipelineLimits` with
+  sane defaults (500 MB file / 10 MB text / 500 PDF pages /
+  10 000 batch files / 5 min timeout); `check_file_size`,
+  `check_text_size`, `with_retry(max_attempts, f)` (linear
+  backoff). New `VerifyError::FileTooLarge`,
+  `VerifyError::CorruptFile`, `VerifyError::ProcessTimeout`
+  variants.
+- **Group C P5 — benchmarking suite.** Five fixtures under
+  `tests/benchmarks/` (Arabic short/medium/long, mixed
+  languages, Pashto sample). New `verify benchmark` subcommand
+  with `--full` for translation + `--compare <prev.json>`
+  for regression detection (>1.2× baseline → flagged).
+  `BenchmarkSuite` JSON serialises round-trip; whichlang
+  benchmark on this host clears 489-word Arabic in <1 ms
+  (≈ 528 K words/sec).
+- **Group D P6 — Strata live integration.** Added
+  `strata_plugin_processes_real_arabic_evidence` integration
+  test (`#[ignore]`-gated on
+  `VERIFY_RUN_INTEGRATION_TESTS=1`) and
+  `strata_plugin_metadata_complete` regression test. Wrote
+  `docs/STRATA_INTEGRATION.md` covering build, registration,
+  artifact shape, and forensic invariants.
+- **Group D P7 — magic-byte content detection.** New helpers
+  `is_pdf_magic`, `is_mp4_magic`, `is_wav_magic`,
+  `is_mp3_magic`, `is_jpeg_magic`, `is_png_magic`,
+  `is_zip_magic`, `is_gzip_magic` plus
+  `detect_input_kind_robust(path)` which reads 16 bytes and
+  corrects wrong/missing extensions. CLI now uses the robust
+  variant in all four call sites (translate, batch, package,
+  resolve_path_input). Falls back to extension-based answer
+  on any I/O error — never panics.
+- **Group D P8 — examiner documentation.** Wrote
+  `docs/USER_MANUAL.md`, `docs/QUICK_REFERENCE.md`,
+  `docs/DEPLOYMENT.md`, and a fresh `README.md` (rewritten
+  from developer-facing to examiner-facing). New
+  `verify docs [topic]` subcommand prints the relevant
+  bundled doc directly from the binary (`include_str!`-baked,
+  works on air-gapped machines without source).
+
 ## What remains for Sprint 10+
 
 - Examiner-assigned speaker labels (overwrite `SPEAKER_00` →

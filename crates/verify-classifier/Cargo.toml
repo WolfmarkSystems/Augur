@@ -20,6 +20,7 @@ thiserror = { workspace = true }
 # workstations that can fetch the LID model once.
 fasttext-pure-rs = "0.1.0"
 whichlang = "0.1.1"
+serde = { version = "1.0.228", features = ["derive"] }
 
 [[example]]
 name = "lid_pure_probe"

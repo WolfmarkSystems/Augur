@@ -41,6 +41,10 @@ pub enum PipelineInput {
     /// `pdf-extract` text layer; falls back to rasterize-and-OCR
     /// (poppler `pdftoppm` + Tesseract) for scanned PDFs.
     Pdf(PathBuf),
+    /// Super Sprint Group B: timestamped subtitles (.srt / .vtt).
+    /// Parser is in `verify_core::subtitle`; the CLI translates
+    /// per cue, preserving timestamps.
+    Subtitle(PathBuf),
 }
 
 /// Auto-detect the pipeline input kind from a file path's extension.
@@ -63,6 +67,7 @@ pub fn detect_input_kind(path: &Path) -> PipelineInput {
         Some("png") | Some("jpg") | Some("jpeg") | Some("tiff") | Some("tif")
         | Some("bmp") | Some("gif") => PipelineInput::Image(path.to_path_buf()),
         Some("pdf") => PipelineInput::Pdf(path.to_path_buf()),
+        Some("srt") | Some("vtt") => PipelineInput::Subtitle(path.to_path_buf()),
         _ => PipelineInput::Audio(path.to_path_buf()),
     }
 }
@@ -105,6 +110,85 @@ impl PipelineResult {
         }
         Ok(())
     }
+}
+
+/// Read up to `n` bytes from the start of `path`. Returns
+/// `None` on any I/O error so the caller can fall back to
+/// extension-based detection without surfacing the read error
+/// (the extension answer is still useful even when the file is
+/// unreadable for a moment).
+fn read_magic_bytes(path: &Path, n: usize) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut buf = vec![0u8; n];
+    let read = f.read(&mut buf).ok()?;
+    buf.truncate(read);
+    Some(buf)
+}
+
+pub fn is_pdf_magic(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"%PDF")
+}
+
+/// MP4 / QuickTime: bytes 4..8 are `ftyp`. Used for both `.mp4`
+/// and `.mov` (the variants differ by the brand bytes that
+/// follow `ftyp`, which we don't inspect).
+pub fn is_mp4_magic(bytes: &[u8]) -> bool {
+    bytes.len() >= 8 && &bytes[4..8] == b"ftyp"
+}
+
+pub fn is_wav_magic(bytes: &[u8]) -> bool {
+    bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WAVE"
+}
+
+/// MP3: either `ID3` tag header or an MPEG audio sync word
+/// (0xFF 0xFB / 0xFF 0xF3 / 0xFF 0xF2).
+pub fn is_mp3_magic(bytes: &[u8]) -> bool {
+    if bytes.starts_with(b"ID3") {
+        return true;
+    }
+    bytes.len() >= 2 && bytes[0] == 0xFF && (bytes[1] & 0xE0) == 0xE0
+}
+
+pub fn is_jpeg_magic(bytes: &[u8]) -> bool {
+    bytes.len() >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF
+}
+
+pub fn is_png_magic(bytes: &[u8]) -> bool {
+    bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A])
+}
+
+pub fn is_zip_magic(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"PK\x03\x04")
+}
+
+pub fn is_gzip_magic(bytes: &[u8]) -> bool {
+    bytes.starts_with(&[0x1F, 0x8B])
+}
+
+/// Super Sprint Group D P7 — content-aware input detection.
+/// Calls [`detect_input_kind`] first (extension-based), then
+/// probes the file's first 16 bytes to correct
+/// wrong-or-missing-extension cases. Falls back to the
+/// extension answer on any I/O error so this never panics.
+pub fn detect_input_kind_robust(path: &Path) -> PipelineInput {
+    let by_extension = detect_input_kind(path);
+    let Some(magic) = read_magic_bytes(path, 16) else {
+        return by_extension;
+    };
+    if is_pdf_magic(&magic) {
+        return PipelineInput::Pdf(path.to_path_buf());
+    }
+    if is_mp4_magic(&magic) {
+        return PipelineInput::Video(path.to_path_buf());
+    }
+    if is_jpeg_magic(&magic) || is_png_magic(&magic) {
+        return PipelineInput::Image(path.to_path_buf());
+    }
+    if is_wav_magic(&magic) || is_mp3_magic(&magic) {
+        return PipelineInput::Audio(path.to_path_buf());
+    }
+    by_extension
 }
 
 /// English-language display name for an ISO 639-1 code. Falls
@@ -489,6 +573,18 @@ mod tests {
         let _ = PipelineInput::Image(PathBuf::from("p.png"));
         let _ = PipelineInput::Video(PathBuf::from("v.mp4"));
         let _ = PipelineInput::Pdf(PathBuf::from("d.pdf"));
+        let _ = PipelineInput::Subtitle(PathBuf::from("s.srt"));
+    }
+
+    #[test]
+    fn subtitle_input_detected_by_extension() {
+        for ext in &["srt", "SRT", "vtt", "VTT"] {
+            let p = PathBuf::from(format!("subs.{ext}"));
+            assert!(
+                matches!(detect_input_kind(&p), PipelineInput::Subtitle(_)),
+                "expected Subtitle for .{ext}"
+            );
+        }
     }
 
     #[test]
@@ -832,6 +928,65 @@ mod tests {
         s.machine_translation_notice = String::new();
         r.summary = Some(s);
         assert!(r.assert_advisory().is_err());
+    }
+
+    #[test]
+    fn magic_byte_helpers_recognize_canonical_signatures() {
+        assert!(is_pdf_magic(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3"));
+        assert!(is_mp4_magic(b"\x00\x00\x00\x18ftypmp42extra"));
+        assert!(is_wav_magic(b"RIFF\x24\x00\x00\x00WAVEfmt "));
+        assert!(is_mp3_magic(b"ID3\x04\x00")); // tagged
+        assert!(is_mp3_magic(&[0xFF, 0xFB, 0x90, 0x00])); // MPEG sync
+        assert!(is_jpeg_magic(&[0xFF, 0xD8, 0xFF, 0xE0]));
+        assert!(is_png_magic(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]));
+        assert!(is_zip_magic(b"PK\x03\x04"));
+        assert!(is_gzip_magic(&[0x1F, 0x8B]));
+        // Negative cases.
+        assert!(!is_pdf_magic(b"NOPE"));
+        assert!(!is_mp4_magic(b"\x00\x00\x00\x00wxyz"));
+        assert!(!is_wav_magic(b"RIFF........"));
+    }
+
+    #[test]
+    fn pdf_with_wrong_extension_is_corrected_by_magic_bytes() {
+        let dir = std::env::temp_dir().join(format!(
+            "verify-magic-pdf-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("looks_like_audio.mp3");
+        // Write PDF magic bytes + a few padding bytes.
+        std::fs::write(&path, b"%PDF-1.4\n%\xe2\xe3\xcf\xd3 garbage").unwrap();
+        let kind = detect_input_kind_robust(&path);
+        assert!(
+            matches!(kind, PipelineInput::Pdf(_)),
+            "magic-byte detection should override .mp3 extension; got {kind:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unknown_magic_falls_through_to_extension() {
+        let dir = std::env::temp_dir().join(format!(
+            "verify-magic-fallback-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("unknown.png");
+        std::fs::write(&path, b"\x00\x01\x02\x03 random bytes").unwrap();
+        // Magic bytes don't match anything → fall back to
+        // extension-based answer (.png → Image).
+        let kind = detect_input_kind_robust(&path);
+        assert!(matches!(kind, PipelineInput::Image(_)));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

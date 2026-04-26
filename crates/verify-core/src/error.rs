@@ -40,4 +40,31 @@ pub enum VerifyError {
     /// "not configured" is a first-class state.
     #[error("geoip database not configured: {0}")]
     GeoIpNotConfigured(String),
+
+    #[error("yara error: {0}")]
+    Yara(String),
+
+    /// Super Sprint Group B P3 — distinct variant so the CLI can
+    /// surface a specific install hint when the `yara` binary
+    /// is missing without string-matching the error message.
+    #[error("yara binary not installed: {0}")]
+    YaraNotInstalled(String),
+
+    /// Super Sprint Group C P4 — file size exceeded the
+    /// configured pipeline limit. Returned with both the actual
+    /// size and the limit so the examiner can decide whether to
+    /// raise the limit or split the file.
+    #[error("file too large: {size_bytes} bytes (limit: {limit_bytes} bytes)")]
+    FileTooLarge { size_bytes: u64, limit_bytes: u64 },
+
+    /// Super Sprint Group C P4 — file exists but a parser
+    /// rejected its contents. Carries the path + a reason
+    /// string so logs are useful.
+    #[error("corrupt file at {path}: {reason}")]
+    CorruptFile { path: String, reason: String },
+
+    /// Super Sprint Group C P4 — a per-file / per-call timeout
+    /// fired before the operation completed.
+    #[error("operation timed out after {seconds}s")]
+    ProcessTimeout { seconds: u64 },
 }
