@@ -391,13 +391,62 @@ opt-in API.
   directly rather than going through a separate Rust-side env
   override.
 
-## What remains for Sprint 6+
+## Sprint 6 decisions (shipped 2026-04-26 — overnight run)
+
+- **Batch report — CSV output + aggregate summary + progress
+  file.** `verify batch --output report.csv` emits an
+  RFC-4180-escaped CSV (`render_batch_csv` + `BATCH_CSV_HEADER`).
+  Any other extension serializes JSON. The JSON form now carries
+  a `summary` field (`BatchSummary`) with `total_files /
+  processed / foreign_language_files / translated_files / errors
+  / languages_detected: {iso → count} / processing_time_seconds`
+  plus the mandatory `machine_translation_notice`. While a batch
+  is running, `<output>.progress.json` is rewritten after each
+  file (counts + last 3 file paths) so an examiner can `tail`
+  it during multi-hour evidence runs without forcing a full
+  results-vec clone per iteration.
+- **Confidence tiers + short-input advisory.** New
+  `ConfidenceTier::{High, Medium, Low}` on
+  `ClassificationResult` plus
+  `classify_confidence(score, word_count) -> ConfidenceTier` and
+  `confidence_advisory(tier, word_count) -> Option<String>`.
+  Inputs under `SHORT_INPUT_WORD_COUNT = 10` always demote to
+  `Low` regardless of model score and surface a "Short input
+  (N words) — verify with a human linguist if critical"
+  advisory. The CLI prints the tier + word count + advisory on
+  every classification; the batch JSON / CSV per-file rows
+  carry `confidence_tier` and `confidence_advisory` fields.
+- **`verify self-test [--full]`** — pre-deployment readiness
+  check. Default form is fully offline: 11 checks covering
+  classification (Arabic / English / empty), tooling
+  availability (ffmpeg / tesseract / pdftoppm), model-cache
+  filesystem state (Whisper, NLLB), `VERIFY_AIRGAP_PATH`, and
+  HF-token presence. `--full` adds an end-to-end translation
+  check that asserts the mandatory MT advisory survives the
+  inference path; missing Python / transformers degrades it to
+  `Skip`, never `Fail`. `ready_for_casework` is `true` only
+  when zero checks failed; `Skip` and `Warning` are advisory.
+- **Pashto / Persian disambiguation.** Both `whichlang` and
+  `lid.176.ftz` confuse Pashto with Farsi at the model level
+  (Sprint 5 P1 probe). Resolution: when
+  `TranslationEngine::advisory()` builds a `TranslationResult`
+  with `source_language == "fa"`, it appends
+  `FARSI_PASHTO_ADVISORY` to the notice (in addition to the
+  mandatory machine-translation advisory — never replacing it).
+  Examiner-facing rationale, mitigation, and other commonly-
+  confused language pairs documented in
+  `docs/LANGUAGE_LIMITATIONS.md`.
+
+## What remains for Sprint 7+
 
 - Examiner-assigned speaker labels (overwrite `SPEAKER_00` →
   `Suspect A` and persist across runs).
 - Real-time transcription (post-v1.0).
 - Optional auto-conversion to ct2 on first install — pay the
   one-time cost up front for the 2.85× steady-state speedup.
-- Pashto/Persian disambiguation — supplement `lid.176.ftz` with
-  a script-aware tiebreaker for cases where the distinction
-  matters forensically.
+- Script-aware Pashto/Persian tiebreaker (orthographic features
+  rather than statistical n-grams) — the Sprint 6 advisory is
+  the right examiner-facing answer; a script-level disambiguator
+  would be a quality improvement on top.
+- Sr/Hr/Bs, Ms/Id, Hi/Ur language-pair advisories along the
+  same shape as Sprint 6's fa/ps disambiguation.

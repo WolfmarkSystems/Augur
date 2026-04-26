@@ -44,6 +44,97 @@ pub struct ClassificationResult {
     pub is_foreign: bool,
     /// Whichever target the examiner asked for (ISO 639-1).
     pub target_language: String,
+    /// Sprint 6 P2 — categorical confidence band for examiner UI.
+    /// `High` when the model is reliable; `Low` when the input is
+    /// too short or the score is below 0.6.
+    pub confidence_tier: ConfidenceTier,
+    /// Number of whitespace-delimited words in the classified
+    /// input — surfaces in the CLI alongside `confidence_tier` so
+    /// examiners see *why* a tier landed where it did.
+    pub input_word_count: usize,
+    /// Human-readable advisory when the result is anything other
+    /// than [`ConfidenceTier::High`]. Empty string on `High`.
+    pub advisory: Option<String>,
+}
+
+/// Confidence tier for an LID classification. Sprint 6 P2 —
+/// surfaces in the CLI and per-file in the batch JSON so examiners
+/// can sort / filter by reliability without doing the math
+/// themselves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfidenceTier {
+    /// Confidence > 0.85 — reliable for casework.
+    High,
+    /// 0.60 – 0.85 — likely correct, verify if critical.
+    Medium,
+    /// < 0.60 OR very-short input — uncertain, human review
+    /// recommended.
+    Low,
+}
+
+impl ConfidenceTier {
+    /// Render the tier as a stable lowercase string for batch JSON
+    /// + CLI output.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::High => "HIGH",
+            Self::Medium => "MEDIUM",
+            Self::Low => "LOW",
+        }
+    }
+}
+
+/// Word-count threshold below which we always demote to `Low` and
+/// surface a "short input" advisory regardless of model score.
+/// Whichlang in particular reports `1.0` on inputs as small as one
+/// word, which is misleading — the model wasn't trained to be
+/// confident on a single word.
+pub const SHORT_INPUT_WORD_COUNT: usize = 10;
+
+/// Compute the [`ConfidenceTier`] from a (score, word_count) pair.
+/// Pure helper — extracted for unit testing without spinning up a
+/// classifier.
+pub fn classify_confidence(score: f32, word_count: usize) -> ConfidenceTier {
+    if word_count > 0 && word_count < SHORT_INPUT_WORD_COUNT {
+        return ConfidenceTier::Low;
+    }
+    if score >= 0.85 {
+        ConfidenceTier::High
+    } else if score >= 0.60 {
+        ConfidenceTier::Medium
+    } else {
+        ConfidenceTier::Low
+    }
+}
+
+/// Build the user-facing advisory string for a non-`High` tier.
+/// Returns `None` for `High`. Spec wording matches VERIFY_SPRINT_6
+/// P2b for the short-input case.
+pub fn confidence_advisory(tier: ConfidenceTier, word_count: usize) -> Option<String> {
+    match tier {
+        ConfidenceTier::High => None,
+        ConfidenceTier::Medium => Some(
+            "Medium confidence — verify with a human linguist if this evidence \
+             is critical to your case."
+                .to_string(),
+        ),
+        ConfidenceTier::Low => {
+            if word_count > 0 && word_count < SHORT_INPUT_WORD_COUNT {
+                Some(format!(
+                    "Short input ({word_count} word{}) — language detection may \
+                     be unreliable. Verify with a human linguist if this evidence \
+                     is critical.",
+                    if word_count == 1 { "" } else { "s" }
+                ))
+            } else {
+                Some(
+                    "Low confidence — language detection may be unreliable. \
+                     Verify with a human linguist if this evidence is critical."
+                        .to_string(),
+                )
+            }
+        }
+    }
 }
 
 impl ClassificationResult {
@@ -55,6 +146,9 @@ impl ClassificationResult {
             confidence: 0.0,
             is_foreign: false,
             target_language: target_language.to_string(),
+            confidence_tier: ConfidenceTier::Low,
+            input_word_count: 0,
+            advisory: None,
         }
     }
 }
@@ -274,11 +368,18 @@ impl LanguageClassifier {
             }
         };
 
+        let input_word_count = text.split_whitespace().count();
+        let tier = classify_confidence(confidence, input_word_count);
+        let advisory = confidence_advisory(tier, input_word_count);
+
         Ok(ClassificationResult {
             is_foreign: !language.is_empty() && language != target_language,
             language,
             confidence,
             target_language: target_language.to_string(),
+            confidence_tier: tier,
+            input_word_count,
+            advisory,
         })
     }
 }
@@ -400,6 +501,56 @@ mod tests {
     }
 
     #[test]
+    fn high_confidence_long_arabic_text() {
+        // 50+-word Arabic text at score 1.0 → High tier with no
+        // advisory. Sprint 6 P2 acceptance test.
+        let classifier = LanguageClassifier::new_whichlang();
+        let arabic = "في صباح يوم الجمعة الماضي توجه فريق التحقيق إلى موقع الحادث في \
+                      الحي الشمالي من المدينة كان الجو غائما ودرجة الحرارة منخفضة وجد \
+                      المحققون عددا من الأدلة المهمة في الموقع بما في ذلك بعض الأوراق \
+                      المكتوبة باليد وجهاز هاتف محمول وحقيبة جلدية صغيرة تم تصوير الموقع \
+                      من زوايا متعددة قبل البدء في جمع الأدلة";
+        let r = classifier.classify(arabic, "en").expect("classify");
+        assert_eq!(r.language, "ar");
+        assert_eq!(r.confidence_tier, ConfidenceTier::High);
+        assert!(r.input_word_count >= SHORT_INPUT_WORD_COUNT);
+        assert!(r.advisory.is_none(), "High tier must have no advisory");
+    }
+
+    #[test]
+    fn low_confidence_very_short_input() {
+        let classifier = LanguageClassifier::new_whichlang();
+        // 3-word input — even at score 1.0, the short-input gate
+        // must demote to Low.
+        let r = classifier.classify("Hola amigo bueno", "en").expect("classify");
+        assert_eq!(r.confidence_tier, ConfidenceTier::Low);
+        assert_eq!(r.input_word_count, 3);
+        let advisory = r.advisory.expect("Low tier must include advisory");
+        assert!(
+            advisory.contains("3 words"),
+            "advisory should cite the word count: {advisory}"
+        );
+    }
+
+    #[test]
+    fn medium_confidence_includes_advisory_text() {
+        // Pure helper test — Medium tier always populates advisory.
+        let tier = classify_confidence(0.70, 50);
+        assert_eq!(tier, ConfidenceTier::Medium);
+        let advisory = confidence_advisory(tier, 50).expect("Medium must advise");
+        assert!(advisory.contains("Medium confidence"));
+    }
+
+    #[test]
+    fn classify_confidence_short_circuits_on_short_input() {
+        // Even a perfect 1.0 score collapses to Low when the input
+        // is too short to be reliable.
+        assert_eq!(classify_confidence(1.0, 5), ConfidenceTier::Low);
+        assert_eq!(classify_confidence(1.0, 9), ConfidenceTier::Low);
+        assert_eq!(classify_confidence(1.0, 10), ConfidenceTier::High);
+    }
+
+    #[test]
     fn handles_empty_input_gracefully() {
         let classifier = LanguageClassifier::new_whichlang();
         let result = classifier.classify("", "en").expect("empty classify");
@@ -477,8 +628,19 @@ mod tests {
         }
     }
 
+    /// Serializes the two airgap tests below. Both mutate the
+    /// process-wide `VERIFY_AIRGAP_PATH` env var; without this
+    /// lock parallel cargo-test threads race and the loser of the
+    /// race observes a download (which on this host returns the
+    /// real `lid.176.ftz` byte size, not the synthetic stub).
+    fn airgap_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn airgap_path_short_circuits_download() {
+        let _guard = airgap_env_lock();
         // Sprint 5 P3 — staging a synthetic ftz under the
         // air-gap path must satisfy ensure_lid_model without any
         // network call. Uses a fresh temp dir so we don't pollute
@@ -524,6 +686,7 @@ mod tests {
 
     #[test]
     fn airgap_path_takes_priority_over_existing_cache() {
+        let _guard = airgap_env_lock();
         // If the cache is empty and AIRGAP_PATH is set, ensure
         // we use the airgap copy rather than triggering a
         // download. Detected by the absence of any curl invocation

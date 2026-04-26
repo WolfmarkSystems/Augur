@@ -46,6 +46,16 @@ pub const TRANSLATION_STUB: &str = "STUB — NLLB-200 integration coming in Spri
 pub const MACHINE_TRANSLATION_NOTICE: &str =
     "Machine translation — verify with a certified human translator for legal proceedings.";
 
+/// Sprint 6 P4 — appended to the advisory notice when the source
+/// language is Persian/Farsi (`fa`). Both whichlang and
+/// `lid.176.ftz` confuse Pashto with Farsi at the model level
+/// (Sprint 5 P1 probe); examiners working in contexts where
+/// Pashto is plausible must verify with a human linguist. See
+/// `docs/LANGUAGE_LIMITATIONS.md` for the full rationale.
+pub const FARSI_PASHTO_ADVISORY: &str =
+    "Note: Automated tools may confuse Farsi (fa) with Pashto (ps). \
+     Verify language identification if this is critical evidence.";
+
 /// The default NLLB model id. The 600M distilled variant runs on
 /// CPU; the 1.3B variant is higher quality but 5+ GB.
 pub const DEFAULT_NLLB_MODEL: &str = "facebook/nllb-200-distilled-600M";
@@ -390,6 +400,17 @@ impl TranslationEngine {
         target_language: &str,
         confidence: f32,
     ) -> TranslationResult {
+        let mut notice = MACHINE_TRANSLATION_NOTICE.to_string();
+        // Sprint 6 P4 — Pashto/Persian disambiguation advisory.
+        // Both `whichlang` and `lid.176.ftz` confuse Pashto with
+        // Farsi at the model level (Sprint 5 P1 probe). Whenever
+        // the source is reported as Farsi, append a one-line
+        // disambiguation hint *in addition to* the mandatory
+        // machine-translation advisory — never replacing it.
+        if source_language == "fa" {
+            notice.push(' ');
+            notice.push_str(FARSI_PASHTO_ADVISORY);
+        }
         TranslationResult {
             source_text: source_text.to_string(),
             translated_text: translated_text.to_string(),
@@ -398,7 +419,7 @@ impl TranslationEngine {
             confidence,
             model: self.model.clone(),
             is_machine_translation: true,
-            advisory_notice: MACHINE_TRANSLATION_NOTICE.to_string(),
+            advisory_notice: notice,
             segments: None,
         }
     }
@@ -524,6 +545,76 @@ mod tests {
         assert_eq!(r.source_language, "ar");
         assert_eq!(r.target_language, "en");
         assert_eq!(r.model, DEFAULT_NLLB_MODEL);
+    }
+
+    #[test]
+    fn farsi_detection_includes_disambiguation_advisory() {
+        // Sprint 6 P4 acceptance test. When source_language is
+        // "fa", the advisory must include the Pashto/Persian
+        // disambiguation hint AND must still carry the mandatory
+        // machine-translation notice (the language advisory
+        // augments, never replaces it).
+        let engine = TranslationEngine {
+            model: DEFAULT_NLLB_MODEL.into(),
+            python_cmd: "python3".into(),
+            hf_cache: None,
+            backend: Backend::Auto,
+        };
+        let r = engine.advisory("ساده", "simple", "fa", "en", 0.8);
+        assert!(r.is_machine_translation);
+        assert!(
+            r.advisory_notice.contains("Machine translation"),
+            "MT notice missing: {}",
+            r.advisory_notice
+        );
+        assert!(
+            r.advisory_notice.contains("Pashto"),
+            "fa-disambiguation missing: {}",
+            r.advisory_notice
+        );
+        assert!(
+            r.advisory_notice.contains("Farsi"),
+            "fa-disambiguation missing Farsi: {}",
+            r.advisory_notice
+        );
+    }
+
+    #[test]
+    fn language_limitations_doc_exists() {
+        // Sprint 6 P4 acceptance. Path is relative to this crate's
+        // manifest dir → workspace root → docs/.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/LANGUAGE_LIMITATIONS.md");
+        assert!(
+            path.exists(),
+            "docs/LANGUAGE_LIMITATIONS.md is missing at {path:?}"
+        );
+        let content = std::fs::read_to_string(&path).expect("read doc");
+        assert!(!content.is_empty());
+        // Spot-check that it actually documents the fa/ps
+        // confusion — the whole point of this file.
+        assert!(content.contains("Pashto"));
+        assert!(content.contains("Farsi"));
+    }
+
+    #[test]
+    fn non_farsi_source_does_not_get_disambiguation_advisory() {
+        let engine = TranslationEngine {
+            model: DEFAULT_NLLB_MODEL.into(),
+            python_cmd: "python3".into(),
+            hf_cache: None,
+            backend: Backend::Auto,
+        };
+        let r = engine.advisory("مرحبا", "Hello", "ar", "en", 0.9);
+        assert!(r.is_machine_translation);
+        assert!(r.advisory_notice.contains("Machine translation"));
+        // Arabic source must NOT trigger the fa/ps disambiguation
+        // — that note is specific to detected Farsi.
+        assert!(
+            !r.advisory_notice.contains("Pashto"),
+            "fa-disambiguation leaked to non-fa source: {}",
+            r.advisory_notice
+        );
     }
 
     #[test]

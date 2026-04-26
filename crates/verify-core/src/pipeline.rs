@@ -118,12 +118,21 @@ impl PipelineResult {
 pub struct BatchFileResult {
     /// Absolute path of the source file.
     pub file_path: String,
-    /// One of `"audio"`, `"video"`, `"image"`, `"text"`.
+    /// One of `"audio"`, `"video"`, `"image"`, `"pdf"`, `"text"`.
     pub input_type: String,
     /// ISO 639-1 language code detected by the classifier (or by
     /// Whisper / OCR when the file was foreign).
     pub detected_language: String,
     pub is_foreign: bool,
+    /// Sprint 6 P2 — categorical confidence band ("HIGH" /
+    /// "MEDIUM" / "LOW"). Empty string when the file errored
+    /// before classification could run.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub confidence_tier: String,
+    /// Sprint 6 P2 — human-readable confidence advisory.
+    /// Populated when `confidence_tier` is "MEDIUM" or "LOW".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confidence_advisory: Option<String>,
     /// Full source text (transcript or OCR output) when available.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_text: Option<String>,
@@ -147,6 +156,29 @@ pub struct BatchSegment {
     pub translated_text: String,
 }
 
+/// Aggregate statistics for a batch run. Sprint 6 P1 — gives
+/// examiners a quick, at-a-glance summary of what came out of the
+/// run plus the breakdown of which languages were detected. Always
+/// carries `machine_translation_notice` so the advisory survives
+/// even when consumers downsample the report to just the summary.
+#[derive(Debug, Clone, Serialize)]
+pub struct BatchSummary {
+    pub total_files: u32,
+    pub processed: u32,
+    pub foreign_language_files: u32,
+    pub translated_files: u32,
+    pub errors: u32,
+    /// Map of detected ISO 639-1 language code → file count.
+    /// Files with no detected language (empty input) are excluded.
+    pub languages_detected: std::collections::BTreeMap<String, u32>,
+    /// Wall-clock duration of the batch run, seconds.
+    pub processing_time_seconds: f64,
+    /// Forensic invariant — same advisory the per-file
+    /// `TranslationResult`s carry, restated at the summary level
+    /// so a consumer reading only the summary still sees it.
+    pub machine_translation_notice: String,
+}
+
 /// Top-level batch report. Always carries the
 /// `machine_translation_notice` so consumers of the JSON cannot
 /// strip the advisory by accident — it is not optional.
@@ -166,6 +198,10 @@ pub struct BatchResult {
     /// purpose of the advisory.
     pub machine_translation_notice: String,
     pub results: Vec<BatchFileResult>,
+    /// Sprint 6 P1 — aggregate stats. Optional in the JSON so
+    /// older consumers parsing pre-Sprint-6 reports still work.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<BatchSummary>,
 }
 
 impl BatchResult {
@@ -179,8 +215,113 @@ impl BatchResult {
                     .to_string(),
             ));
         }
+        if let Some(s) = &self.summary {
+            if s.translated_files > 0 && s.machine_translation_notice.is_empty() {
+                return Err(VerifyError::Translate(
+                    "BatchSummary.machine_translation_notice missing — \
+                     forensic invariant violation"
+                        .to_string(),
+                ));
+            }
+        }
         Ok(())
     }
+
+    /// Build a [`BatchSummary`] from `self` plus the wall-clock
+    /// duration. Counts each detected language once per file —
+    /// zero-length transcripts (empty audio, blank PDFs) are not
+    /// counted.
+    pub fn build_summary(&self, processing_time_seconds: f64, mt_notice: &str) -> BatchSummary {
+        let mut languages_detected: std::collections::BTreeMap<String, u32> =
+            std::collections::BTreeMap::new();
+        for r in &self.results {
+            if r.detected_language.is_empty() {
+                continue;
+            }
+            *languages_detected
+                .entry(r.detected_language.clone())
+                .or_insert(0) += 1;
+        }
+        BatchSummary {
+            total_files: self.total_files,
+            processed: self.processed,
+            foreign_language_files: self.foreign_language,
+            translated_files: self.translated,
+            errors: self.errors,
+            languages_detected,
+            processing_time_seconds,
+            machine_translation_notice: mt_notice.to_string(),
+        }
+    }
+}
+
+/// CSV-row form of [`BatchFileResult`]. Used by the CLI's
+/// `--output report.csv` path. Fields match the spec column
+/// order; embedded quotes / newlines / commas are escaped per
+/// RFC 4180 by [`render_csv_row`].
+#[derive(Debug, Clone)]
+pub struct BatchCsvRow<'a> {
+    pub file_path: &'a str,
+    pub input_type: &'a str,
+    pub detected_language: &'a str,
+    pub is_foreign: bool,
+    pub transcript: &'a str,
+    pub translation: &'a str,
+    pub error: &'a str,
+}
+
+/// CSV header row in the order spec'd by VERIFY_SPRINT_6.md P1a.
+pub const BATCH_CSV_HEADER: &str =
+    "file_path,input_type,detected_language,is_foreign,transcript,translation,error";
+
+/// Render one CSV row with RFC-4180-compatible escaping. Fields
+/// containing `,`, `"`, `\r`, or `\n` get wrapped in quotes; any
+/// embedded `"` is doubled.
+pub fn render_csv_row(row: &BatchCsvRow<'_>) -> String {
+    fn esc(s: &str) -> String {
+        if s.is_empty() {
+            return String::new();
+        }
+        if s.contains(',') || s.contains('"') || s.contains('\n') || s.contains('\r') {
+            let escaped = s.replace('"', "\"\"");
+            format!("\"{escaped}\"")
+        } else {
+            s.to_string()
+        }
+    }
+    format!(
+        "{},{},{},{},{},{},{}",
+        esc(row.file_path),
+        esc(row.input_type),
+        esc(row.detected_language),
+        if row.is_foreign { "true" } else { "false" },
+        esc(row.transcript),
+        esc(row.translation),
+        esc(row.error),
+    )
+}
+
+/// Serialize the whole [`BatchResult`] to CSV text — header line
+/// plus one row per file. Errors propagated from individual rows
+/// land in the `error` column.
+pub fn render_batch_csv(report: &BatchResult) -> String {
+    let mut out = String::with_capacity(BATCH_CSV_HEADER.len() + report.results.len() * 80);
+    out.push_str(BATCH_CSV_HEADER);
+    out.push('\n');
+    for r in &report.results {
+        let row = BatchCsvRow {
+            file_path: &r.file_path,
+            input_type: &r.input_type,
+            detected_language: &r.detected_language,
+            is_foreign: r.is_foreign,
+            transcript: r.source_text.as_deref().unwrap_or(""),
+            translation: r.translated_text.as_deref().unwrap_or(""),
+            error: r.error.as_deref().unwrap_or(""),
+        };
+        out.push_str(&render_csv_row(&row));
+        out.push('\n');
+    }
+    out
 }
 
 #[cfg(test)]
@@ -259,6 +400,80 @@ mod tests {
         }
     }
 
+    fn make_row(
+        path: &str,
+        lang: &str,
+        is_foreign: bool,
+        src: Option<&str>,
+        tx: Option<&str>,
+        err: Option<&str>,
+    ) -> BatchFileResult {
+        BatchFileResult {
+            file_path: path.into(),
+            input_type: "audio".into(),
+            detected_language: lang.into(),
+            is_foreign,
+            confidence_tier: if lang.is_empty() {
+                String::new()
+            } else {
+                "HIGH".into()
+            },
+            confidence_advisory: None,
+            source_text: src.map(str::to_string),
+            translated_text: tx.map(str::to_string),
+            segments: None,
+            error: err.map(str::to_string),
+        }
+    }
+
+    fn fixture_with_results(translated: u32) -> BatchResult {
+        let r1 = make_row(
+            "/ev/a.mp3",
+            "ar",
+            true,
+            Some("مرحبا بالعالم"),
+            Some("Hello world"),
+            None,
+        );
+        let r2 = make_row(
+            "/ev/b.mp3",
+            "ar",
+            true,
+            Some("نص آخر"),
+            Some("More text"),
+            None,
+        );
+        let r3 = make_row(
+            "/ev/c.mp3",
+            "zh",
+            true,
+            Some("你好世界"),
+            Some("Hello world"),
+            None,
+        );
+        let r4 = make_row(
+            "/ev/d.mp3",
+            "en",
+            false,
+            Some("English text here"),
+            None,
+            None,
+        );
+        let r5 = make_row("/ev/e.mp3", "", false, None, None, Some("decoding failed"));
+        BatchResult {
+            generated_at: "2026-04-26T00:00:00Z".into(),
+            total_files: 5,
+            processed: 4,
+            foreign_language: 3,
+            translated,
+            errors: 1,
+            target_language: "en".into(),
+            machine_translation_notice: "Machine translation — verify.".into(),
+            results: vec![r1, r2, r3, r4, r5],
+            summary: None,
+        }
+    }
+
     #[test]
     fn batch_result_advisory_required_when_translations_present() {
         let r = BatchResult {
@@ -271,6 +486,7 @@ mod tests {
             target_language: "en".into(),
             machine_translation_notice: String::new(),
             results: vec![],
+            summary: None,
         };
         assert!(r.assert_advisory().is_err());
     }
@@ -287,15 +503,13 @@ mod tests {
             target_language: "en".into(),
             machine_translation_notice: "advisory present".into(),
             results: vec![],
+            summary: None,
         };
         assert!(r.assert_advisory().is_ok());
     }
 
     #[test]
     fn batch_result_counts_are_balanced() {
-        // total_files = processed + errors invariant — pinned by
-        // a synthetic result so a future caller can't construct a
-        // count-skewed report by accident in well-formed code.
         let r = BatchResult {
             generated_at: "2026-04-25T00:00:00Z".into(),
             total_files: 10,
@@ -306,8 +520,71 @@ mod tests {
             target_language: "en".into(),
             machine_translation_notice: "x".into(),
             results: vec![],
+            summary: None,
         };
         assert_eq!(r.total_files, r.processed + r.errors);
+    }
+
+    #[test]
+    fn batch_csv_output_has_correct_headers() {
+        let r = fixture_with_results(3);
+        let csv = render_batch_csv(&r);
+        let first_line = csv.lines().next().expect("at least one line");
+        assert_eq!(first_line, BATCH_CSV_HEADER);
+        // Spot-check a translated row makes it through.
+        assert!(csv.contains("Hello world"));
+        // Boolean is_foreign rendered as `true`/`false`, not `True`/`1`.
+        assert!(csv.contains(",true,"));
+        assert!(csv.contains(",false,"));
+    }
+
+    #[test]
+    fn batch_csv_escapes_commas_and_quotes() {
+        let row = BatchCsvRow {
+            file_path: "/ev/a.mp3",
+            input_type: "audio",
+            detected_language: "en",
+            is_foreign: false,
+            transcript: "He said \"hi, friend\" today",
+            translation: "",
+            error: "",
+        };
+        let line = render_csv_row(&row);
+        // The transcript field contains both a quote and a comma →
+        // gets RFC-4180-quoted with embedded `"` doubled.
+        assert!(line.contains("\"He said \"\"hi, friend\"\" today\""));
+    }
+
+    #[test]
+    fn batch_summary_languages_counts_correctly() {
+        let r = fixture_with_results(3);
+        let s = r.build_summary(1.5, &r.machine_translation_notice);
+        assert_eq!(s.languages_detected.get("ar"), Some(&2));
+        assert_eq!(s.languages_detected.get("zh"), Some(&1));
+        assert_eq!(s.languages_detected.get("en"), Some(&1));
+        // The errored file had no detected language → not counted.
+        assert!(!s.languages_detected.contains_key(""));
+        assert_eq!(s.translated_files, 3);
+        assert_eq!(s.foreign_language_files, 3);
+    }
+
+    #[test]
+    fn batch_summary_machine_translation_notice_present() {
+        let r = fixture_with_results(3);
+        let s = r.build_summary(0.0, &r.machine_translation_notice);
+        assert!(!s.machine_translation_notice.is_empty());
+    }
+
+    #[test]
+    fn batch_advisory_rejects_summary_with_empty_notice() {
+        // Forensic invariant — even when the top-level field is
+        // populated, an embedded summary missing the notice must
+        // fail assert_advisory.
+        let mut r = fixture_with_results(3);
+        let mut s = r.build_summary(0.0, &r.machine_translation_notice);
+        s.machine_translation_notice = String::new();
+        r.summary = Some(s);
+        assert!(r.assert_advisory().is_err());
     }
 
     #[test]

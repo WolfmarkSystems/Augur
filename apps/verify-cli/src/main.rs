@@ -5,12 +5,15 @@
 //! fastText or whichlang) plus Sprint-1 stubs for STT and
 //! translation; Sprint 2 replaces the stubs.
 
+mod selftest;
+
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use verify_classifier::{LanguageClassifier, ModelManager as ClassifierModelManager};
 use verify_core::pipeline::{
-    detect_input_kind, BatchFileResult, BatchResult, BatchSegment, PipelineInput,
+    detect_input_kind, render_batch_csv, BatchFileResult, BatchResult, BatchSegment,
+    PipelineInput,
 };
 use verify_core::VerifyError;
 use verify_ocr::{extract_pdf_text, iso_to_tesseract, OcrEngine};
@@ -189,6 +192,20 @@ enum Command {
         diarize: bool,
     },
 
+    /// Pre-deployment readiness check — runs a battery of
+    /// classification, model-cache, and tooling checks and reports
+    /// whether the installation is ready for casework. Default
+    /// form is fully offline; `--full` opts into running real
+    /// translation inference end-to-end.
+    SelfTest {
+        /// Trigger the inference checks (Whisper / NLLB end-to-end).
+        /// Requires Python + transformers installed for the
+        /// translation arm; without them that check downgrades to
+        /// `Skip`, never `Fail`.
+        #[arg(long, default_value_t = false)]
+        full: bool,
+    },
+
     /// One-time setup commands. Currently writes a Hugging Face
     /// access token used by the optional speaker-diarization
     /// feature (`--diarize`); the token lives at
@@ -216,11 +233,14 @@ enum Command {
         target: String,
 
         /// Comma-separated list of input kinds to include
-        /// (`audio,video,image`). Default: all three.
+        /// (`audio,video,image,pdf`). Default: all four.
         #[arg(long, value_delimiter = ',')]
         types: Option<Vec<String>>,
 
-        /// Optional output path for the JSON report.
+        /// Optional output path for the report. Format is
+        /// inferred from extension: `.csv` → CSV, anything else
+        /// → JSON. The CSV form has one row per file with the
+        /// columns enumerated in `BATCH_CSV_HEADER`.
         #[arg(long)]
         output: Option<PathBuf>,
 
@@ -320,6 +340,7 @@ fn run(
             diarize,
         ),
         Command::Setup { hf_token } => cmd_setup(&hf_token),
+        Command::SelfTest { full } => cmd_self_test(full),
         Command::Batch {
             input,
             target,
@@ -352,12 +373,32 @@ fn cmd_classify(
     if result.language.is_empty() {
         println_verify("Language detected: (none) — input empty or whitespace-only");
     } else {
-        println_verify(format!(
-            "Language detected: {} (confidence: {:.2}) — is_foreign={}",
-            result.language, result.confidence, result.is_foreign,
-        ));
+        print_classification(&result);
     }
     Ok(())
+}
+
+/// Render a `ClassificationResult` to the CLI in the multi-line
+/// format spec'd by VERIFY_SPRINT_6 P2c — language, confidence
+/// tier + raw score, input word count, and the advisory line
+/// when the tier is anything other than `High`.
+fn print_classification(r: &verify_classifier::ClassificationResult) {
+    println_verify(format!(
+        "Language detected: {} (target: {}) — is_foreign={}",
+        r.language, r.target_language, r.is_foreign,
+    ));
+    println_verify(format!(
+        "         Confidence: {} ({:.2})",
+        r.confidence_tier.as_str(),
+        r.confidence,
+    ));
+    println_verify(format!(
+        "         Input: {} word(s)",
+        r.input_word_count
+    ));
+    if let Some(adv) = &r.advisory {
+        println_verify(format!("         ⚠ {adv}"));
+    }
 }
 
 // ── transcribe ───────────────────────────────────────────────────
@@ -647,6 +688,44 @@ fn best_speaker(start_ms: u64, end_ms: u64, diar: &[DiarizationSegment]) -> Stri
         .unwrap_or_else(|| "UNKNOWN".to_string())
 }
 
+fn cmd_self_test(full: bool) -> Result<(), VerifyError> {
+    println_verify("Running self-test...");
+    println_verify("");
+    let result = selftest::run_self_test(full)?;
+    for c in &result.checks {
+        let line = format!(
+            "{} [{}] {}: {}",
+            c.status.glyph(),
+            c.status.label(),
+            c.name,
+            c.message,
+        );
+        println_verify(line);
+    }
+    println_verify("");
+    let summary = format!(
+        "Self-test {label} ({} passed, {} failed, {} skipped, {} warnings)",
+        result.passed,
+        result.failed,
+        result.skipped,
+        result.warnings,
+        label = if result.ready_for_casework {
+            "PASSED"
+        } else {
+            "FAILED"
+        }
+    );
+    println_verify(summary);
+    if result.ready_for_casework {
+        println_verify("This installation is ready for casework.");
+        Ok(())
+    } else {
+        Err(VerifyError::InvalidInput(
+            "self-test reported one or more failures — see check list above".to_string(),
+        ))
+    }
+}
+
 fn cmd_setup(token: &str) -> Result<(), VerifyError> {
     let mgr = HfTokenManager::with_xdg_cache()?;
     mgr.save(token)?;
@@ -840,6 +919,20 @@ fn cmd_batch(
     let mut foreign_count = 0u32;
     let mut translated_count = 0u32;
     let total = files.len() as u32;
+    let started = std::time::Instant::now();
+
+    // Sprint 6 P1c — progress file for long batches. When `--output`
+    // is set, we write `<output>.progress.json` after each file so
+    // an examiner can `tail` it during a multi-hour run.
+    let progress_path: Option<PathBuf> = output.map(|p| {
+        let mut q = p.to_path_buf();
+        let name = q
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "report".to_string());
+        q.set_file_name(format!("{name}.progress.json"));
+        q
+    });
 
     for (idx, file) in files.iter().enumerate() {
         let kind = detect_input_kind(file);
@@ -887,6 +980,8 @@ fn cmd_batch(
                     input_type: kind_label.to_string(),
                     detected_language: String::new(),
                     is_foreign: false,
+                    confidence_tier: String::new(),
+                    confidence_advisory: None,
                     source_text: None,
                     translated_text: None,
                     segments: None,
@@ -894,9 +989,31 @@ fn cmd_batch(
                 });
             }
         }
+
+        if let Some(pp) = &progress_path {
+            // Best-effort: write a snapshot for `tail`-style
+            // monitoring. A failure to write must not abort the
+            // batch — log + continue. We serialize a lightweight
+            // view (counts + last-N file paths) rather than the
+            // full results vec so this stays O(1) per file.
+            if let Err(e) = write_progress(
+                pp,
+                target,
+                total,
+                processed,
+                foreign_count,
+                translated_count,
+                errors,
+                &results,
+                started.elapsed().as_secs_f64(),
+            ) {
+                log::warn!("batch: failed writing progress file {pp:?}: {e}");
+            }
+        }
     }
 
-    let report = BatchResult {
+    let elapsed = started.elapsed().as_secs_f64();
+    let mut report = BatchResult {
         generated_at: utc_now_iso8601(),
         total_files: total,
         processed,
@@ -906,7 +1023,10 @@ fn cmd_batch(
         target_language: target.to_string(),
         machine_translation_notice: MACHINE_TRANSLATION_NOTICE.to_string(),
         results,
+        summary: None,
     };
+    let summary = report.build_summary(elapsed, MACHINE_TRANSLATION_NOTICE);
+    report.summary = Some(summary);
     report.assert_advisory()?;
 
     println_verify(format!(
@@ -915,13 +1035,88 @@ fn cmd_batch(
     ));
 
     if let Some(out_path) = output {
-        let json = serde_json::to_string_pretty(&report).map_err(|e| {
-            VerifyError::Translate(format!("batch JSON serialise: {e}"))
-        })?;
-        std::fs::write(out_path, json)?;
+        write_batch_report(out_path, &report)?;
         println_verify(format!("Report written to {out_path:?}"));
+        // The progress file is intentionally NOT removed — examiners
+        // may want it as evidence of a long-run audit trail. Note its
+        // path explicitly.
+        if let Some(pp) = &progress_path {
+            println_verify(format!("Progress snapshots: {pp:?}"));
+        }
     }
 
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_progress(
+    path: &std::path::Path,
+    target: &str,
+    total: u32,
+    processed: u32,
+    foreign_count: u32,
+    translated_count: u32,
+    errors: u32,
+    results: &[BatchFileResult],
+    elapsed_secs: f64,
+) -> Result<(), VerifyError> {
+    // Lightweight, O(1)-per-file: never copies the full results
+    // vec. Just the counts + the last-3 file paths so an examiner
+    // tailing the file can see live progress.
+    let recent: Vec<&str> = results
+        .iter()
+        .rev()
+        .take(3)
+        .map(|r| r.file_path.as_str())
+        .collect();
+    let snapshot = serde_json::json!({
+        "generated_at": utc_now_iso8601(),
+        "target_language": target,
+        "total_files": total,
+        "processed": processed,
+        "foreign_language": foreign_count,
+        "translated": translated_count,
+        "errors": errors,
+        "elapsed_seconds": elapsed_secs,
+        "recent_files": recent,
+        "machine_translation_notice": MACHINE_TRANSLATION_NOTICE,
+        "complete": false,
+    });
+    let body = serde_json::to_string_pretty(&snapshot)
+        .map_err(|e| VerifyError::Translate(format!("progress JSON serialise: {e}")))?;
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    std::fs::write(path, body)?;
+    Ok(())
+}
+
+/// Render and write a [`BatchResult`] to `out_path`. Format chosen
+/// by the path's extension: `.csv` → RFC-4180 CSV, anything else
+/// → pretty-printed JSON.
+fn write_batch_report(
+    out_path: &std::path::Path,
+    report: &BatchResult,
+) -> Result<(), VerifyError> {
+    let is_csv = out_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.eq_ignore_ascii_case("csv"))
+        .unwrap_or(false);
+    let body = if is_csv {
+        render_batch_csv(report)
+    } else {
+        serde_json::to_string_pretty(report)
+            .map_err(|e| VerifyError::Translate(format!("batch JSON serialise: {e}")))?
+    };
+    if let Some(parent) = out_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    std::fs::write(out_path, body)?;
     Ok(())
 }
 
@@ -968,6 +1163,8 @@ fn process_one_file(
             input_type: kind_label.to_string(),
             detected_language: resolved.upstream_lang,
             is_foreign: false,
+            confidence_tier: String::new(),
+            confidence_advisory: None,
             source_text: None,
             translated_text: None,
             segments: None,
@@ -976,15 +1173,15 @@ fn process_one_file(
     }
 
     // Re-classify the produced text — same logic as cmd_translate.
-    let lang = {
-        let classifier = build_classifier(backend)?;
-        let cr = classifier.classify(&resolved.text, target)?;
-        if cr.language.is_empty() {
-            resolved.upstream_lang.clone()
-        } else {
-            cr.language
-        }
+    let classifier = build_classifier(backend)?;
+    let cr = classifier.classify(&resolved.text, target)?;
+    let lang = if cr.language.is_empty() {
+        resolved.upstream_lang.clone()
+    } else {
+        cr.language.clone()
     };
+    let confidence_tier = cr.confidence_tier.as_str().to_string();
+    let confidence_advisory = cr.advisory.clone();
     let is_foreign = lang != target;
 
     if !is_foreign {
@@ -993,6 +1190,8 @@ fn process_one_file(
             input_type: kind_label.to_string(),
             detected_language: lang,
             is_foreign: false,
+            confidence_tier,
+            confidence_advisory,
             source_text: Some(resolved.text),
             translated_text: None,
             segments: None,
@@ -1028,6 +1227,8 @@ fn process_one_file(
         input_type: kind_label.to_string(),
         detected_language: lang,
         is_foreign: true,
+        confidence_tier,
+        confidence_advisory,
         source_text: Some(translation.source_text.clone()),
         translated_text: Some(translation.translated_text.clone()),
         segments,
