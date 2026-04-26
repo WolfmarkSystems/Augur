@@ -9,6 +9,7 @@
 //! Sprint 1 scaffold: only `error` + `pipeline` module shells exist.
 //! Real orchestration logic lands in Sprint 2+.
 
+pub mod dialect_routing;
 pub mod error;
 pub mod geoip;
 pub mod models;

@@ -1373,81 +1373,247 @@ fn cmd_translate_ndjson(
         other => other,
     };
 
-    let translation_result = match resolved_engine {
-        TranslationEngineKind::Seamless => {
-            let seamless = match SeamlessEngine::with_xdg_cache() {
-                Ok(s) => s,
-                Err(e) => {
-                    emit_error_ndjson(&format!("{e}"));
-                    return Err(e);
-                }
-            };
-            seamless.translate(&resolved.text, &lang, target)
-        }
-        _ => {
-            let mut engine = match TranslationEngine::with_xdg_cache() {
-                Ok(e) => e,
-                Err(e) => {
-                    emit_error_ndjson(&format!("{e}"));
-                    return Err(e);
-                }
-            };
-            engine.backend = translation_backend;
-            if let Some(segs) = &resolved.segments {
-                let trips: Vec<(u64, u64, String)> = segs
-                    .iter()
-                    .map(|s| (s.start_ms, s.end_ms, s.text.clone()))
-                    .collect();
-                engine.translate_segments(&trips, &lang, target)
-            } else {
-                engine.translate(&resolved.text, &lang, target)
+    // Sprint 14 P1 — true streaming. We translate one unit at a
+    // time (one STT segment, or one sentence of text input) and
+    // emit + flush stdout after each so the desktop GUI sees the
+    // segments arrive live, not as a batch at completion time.
+    //
+    // Sprint 15 P2 — when the source is Arabic, run the dialect
+    // router first and emit a `dialect_routing` event before any
+    // segment lands. The router decides whether to use NLLB with
+    // a dialect-specific token (arz_Arab / apc_Arab / acm_Arab /
+    // ary_Arab / ara_Arab) or to route Moroccan Darija through
+    // SeamlessM4T (when installed).
+    let routing = if lang == "ar" {
+        let installed_seamless =
+            augur_core::models::find_model("seamless-m4t-medium")
+                .map(augur_core::models::is_installed)
+                .unwrap_or(false);
+        let detected_kind = match classification
+            .arabic_dialect
+            .unwrap_or(augur_classifier::ArabicDialect::Unknown)
+        {
+            augur_classifier::ArabicDialect::ModernStandard => {
+                augur_core::dialect_routing::DialectKind::ModernStandard
             }
-        }
+            augur_classifier::ArabicDialect::Egyptian => {
+                augur_core::dialect_routing::DialectKind::Egyptian
+            }
+            augur_classifier::ArabicDialect::Levantine => {
+                augur_core::dialect_routing::DialectKind::Levantine
+            }
+            augur_classifier::ArabicDialect::Gulf => {
+                augur_core::dialect_routing::DialectKind::Gulf
+            }
+            augur_classifier::ArabicDialect::Iraqi => {
+                augur_core::dialect_routing::DialectKind::Iraqi
+            }
+            augur_classifier::ArabicDialect::Moroccan => {
+                augur_core::dialect_routing::DialectKind::Moroccan
+            }
+            augur_classifier::ArabicDialect::Yemeni => {
+                augur_core::dialect_routing::DialectKind::Yemeni
+            }
+            augur_classifier::ArabicDialect::Sudanese => {
+                augur_core::dialect_routing::DialectKind::Sudanese
+            }
+            augur_classifier::ArabicDialect::Unknown => {
+                augur_core::dialect_routing::DialectKind::Unknown
+            }
+        };
+        let analysis = augur_core::dialect_routing::DialectAnalysisInput {
+            detected_dialect: detected_kind,
+            confidence: classification.arabic_dialect_confidence,
+        };
+        let decision = augur_core::dialect_routing::route_arabic_translation(
+            &analysis,
+            installed_seamless,
+        );
+        let json = serde_json::json!({
+            "type": "dialect_routing",
+            "dialect": format!("{:?}", detected_kind),
+            "confidence": analysis.confidence,
+            "route": decision.route_label(),
+            "model": decision.model_used,
+            "reason": decision.reason,
+            "dialect_advisory": decision.dialect_advisory,
+            "machine_translation_notice": MACHINE_TRANSLATION_NOTICE,
+        });
+        println!("{json}");
+        flush_stdout();
+        Some(decision)
+    } else {
+        None
     };
-    let translation = match translation_result {
-        Ok(t) => t,
+
+    // Build the work-list of (start_ms, end_ms, text) triples.
+    // For audio/video the STT segments are authoritative; for text
+    // input we sentence-split so each sentence is its own unit and
+    // streams independently.
+    let work: Vec<(Option<u64>, Option<u64>, String)> =
+        if let Some(segs) = &resolved.segments {
+            segs.iter()
+                .map(|s| (Some(s.start_ms), Some(s.end_ms), s.text.clone()))
+                .collect()
+        } else {
+            split_sentences(&resolved.text)
+                .into_iter()
+                .map(|s| (None, None, s))
+                .collect()
+        };
+
+    // Pre-build the heavy engines once so we don't pay startup
+    // cost per segment.
+    let mut nllb_engine = match TranslationEngine::with_xdg_cache() {
+        Ok(e) => e,
         Err(e) => {
             emit_error_ndjson(&format!("{e}"));
             return Err(e);
         }
     };
-
-    let total_segments = if let Some(segments) = &translation.segments {
-        for (i, seg) in segments.iter().enumerate() {
-            let json = serde_json::json!({
-                "type": "segment",
-                "index": i,
-                "start_ms": seg.start_ms,
-                "end_ms": seg.end_ms,
-                "original": seg.source_text,
-                "translated": seg.translated_text,
-                "is_complete": true,
-            });
-            println!("{json}");
+    nllb_engine.backend = translation_backend;
+    let seamless_engine_lazy: Option<SeamlessEngine> = if matches!(
+        (resolved_engine, routing.as_ref().map(|r| r.route)),
+        (TranslationEngineKind::Seamless, _)
+            | (
+                _,
+                Some(augur_core::dialect_routing::TranslationRoute::SeamlessM4T)
+            )
+    ) {
+        match SeamlessEngine::with_xdg_cache() {
+            Ok(s) => Some(s),
+            Err(e) => {
+                emit_error_ndjson(&format!("{e}"));
+                return Err(e);
+            }
         }
-        segments.len()
     } else {
+        None
+    };
+
+    // Resolve the source-language string passed to the worker.
+    // Routing decisions for Arabic dialects override the plain
+    // `ar` ISO with a dialect-specific NLLB token.
+    let source_for_nllb: String = match routing.as_ref().map(|r| r.route) {
+        Some(augur_core::dialect_routing::TranslationRoute::NllbEgyptian) => {
+            "arz_Arab".into()
+        }
+        Some(augur_core::dialect_routing::TranslationRoute::NllbLevantine) => {
+            "apc_Arab".into()
+        }
+        Some(augur_core::dialect_routing::TranslationRoute::NllbIraqi) => {
+            "acm_Arab".into()
+        }
+        Some(augur_core::dialect_routing::TranslationRoute::NllbMoroccan) => {
+            "ary_Arab".into()
+        }
+        _ => lang.clone(),
+    };
+    let use_dialect_token = routing
+        .as_ref()
+        .map(|r| {
+            matches!(
+                r.route,
+                augur_core::dialect_routing::TranslationRoute::NllbEgyptian
+                    | augur_core::dialect_routing::TranslationRoute::NllbLevantine
+                    | augur_core::dialect_routing::TranslationRoute::NllbIraqi
+                    | augur_core::dialect_routing::TranslationRoute::NllbMoroccan
+            )
+        })
+        .unwrap_or(false);
+
+    let mut last_advisory = MACHINE_TRANSLATION_NOTICE.to_string();
+    let total_segments = work.len();
+    for (i, (start, end, text)) in work.iter().enumerate() {
+        if text.trim().is_empty() {
+            continue;
+        }
+        let seamless_route = matches!(
+            routing.as_ref().map(|r| r.route),
+            Some(augur_core::dialect_routing::TranslationRoute::SeamlessM4T)
+        ) || matches!(resolved_engine, TranslationEngineKind::Seamless);
+        let single = if seamless_route {
+            seamless_engine_lazy
+                .as_ref()
+                .expect("Seamless engine pre-built when route demanded it")
+                .translate(text, &lang, target)
+        } else if use_dialect_token {
+            nllb_engine.translate_with_nllb_token(text, &source_for_nllb, target)
+        } else {
+            nllb_engine.translate(text, &lang, target)
+        };
+        let single = match single {
+            Ok(t) => t,
+            Err(e) => {
+                emit_error_ndjson(&format!("{e}"));
+                return Err(e);
+            }
+        };
+        last_advisory = single.advisory_notice.clone();
         let json = serde_json::json!({
             "type": "segment",
-            "index": 0,
-            "start_ms": null,
-            "end_ms": null,
-            "original": translation.source_text,
-            "translated": translation.translated_text,
+            "index": i,
+            "start_ms": start,
+            "end_ms": end,
+            "original": single.source_text,
+            "translated": single.translated_text,
             "is_complete": true,
         });
         println!("{json}");
-        1
-    };
+        flush_stdout();
+    }
 
     let json = serde_json::json!({
         "type": "complete",
         "total_segments": total_segments,
         "duration_ms": started.elapsed().as_millis() as u64,
-        "machine_translation_notice": translation.advisory_notice,
+        "machine_translation_notice": last_advisory,
     });
     println!("{json}");
+    flush_stdout();
     Ok(())
+}
+
+/// Sprint 14 P1 — explicit stdout flush after every NDJSON line.
+/// Without this the OS buffers stdout when the consumer is a
+/// pipe, defeating the streaming contract.
+fn flush_stdout() {
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+}
+
+/// Sprint 14 P1 — sentence splitter for the text-input path.
+/// Splits on `.`, `!`, `?`, Arabic full stop, Urdu period, and
+/// the Arabic question mark. Trailing punctuation is preserved
+/// on each sentence so the original text round-trips faithfully
+/// when concatenated.
+fn split_sentences(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let terminators = ['.', '!', '?', '\u{06D4}', '\u{061F}', '\u{3002}'];
+    for ch in text.chars() {
+        current.push(ch);
+        if terminators.contains(&ch) {
+            let trimmed = current.trim().to_string();
+            if !trimmed.is_empty() {
+                out.push(trimmed);
+            }
+            current.clear();
+        }
+    }
+    let tail = current.trim().to_string();
+    if !tail.is_empty() {
+        out.push(tail);
+    }
+    if out.is_empty() {
+        // Fall back to the whole input — never return an empty
+        // work list when the caller had non-empty text.
+        let trimmed = text.trim().to_string();
+        if !trimmed.is_empty() {
+            out.push(trimmed);
+        }
+    }
+    out
 }
 
 fn emit_error_ndjson(message: &str) {

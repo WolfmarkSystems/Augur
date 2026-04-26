@@ -291,6 +291,59 @@ impl TranslationEngine {
         ))
     }
 
+    /// Sprint 15 P2 — translate using a caller-supplied NLLB
+    /// language token instead of the ISO-mapped default. Used by
+    /// the dialect router to pass `arz_Arab` (Egyptian),
+    /// `apc_Arab` (Levantine), `acm_Arab` (Iraqi), or `ary_Arab`
+    /// (Moroccan) directly to the worker. Caller is responsible
+    /// for picking a token NLLB-200 actually supports.
+    pub fn translate_with_nllb_token(
+        &self,
+        source_text: &str,
+        source_nllb_token: &str,
+        target_language: &str,
+    ) -> Result<TranslationResult, AugurError> {
+        if source_text.trim().is_empty() {
+            return Ok(self.advisory(
+                source_text,
+                "",
+                source_nllb_token,
+                target_language,
+                0.0,
+            ));
+        }
+        let tgt = iso_to_nllb(target_language)?;
+        if let Some(cache) = &self.hf_cache {
+            std::fs::create_dir_all(cache)?;
+        }
+        let chosen = self.pick_backend();
+        let translated = match chosen {
+            Backend::Ctranslate2 => match self.run_ct2(source_text, source_nllb_token, tgt) {
+                Ok(t) => t,
+                Err(e) if self.backend == Backend::Auto => {
+                    warn!(
+                        "augur-translate: ctranslate2 backend failed ({e}); \
+                         falling back to transformers."
+                    );
+                    self.run_transformers(source_text, source_nllb_token, tgt)?
+                }
+                Err(e) => return Err(e),
+            },
+            Backend::Transformers => self.run_transformers(source_text, source_nllb_token, tgt)?,
+            Backend::Auto => self.run_transformers(source_text, source_nllb_token, tgt)?,
+        };
+        // Surface the dialect-specific token in the result's
+        // source_language field so downstream consumers see what
+        // was actually sent to the model.
+        Ok(self.advisory(
+            source_text,
+            &translated,
+            source_nllb_token,
+            target_language,
+            0.85,
+        ))
+    }
+
     fn run_transformers(&self, text: &str, src: &str, tgt: &str) -> Result<String, AugurError> {
         warn!(
             "augur-translate: invoking NLLB-200 ({src} → {tgt}) via transformers — \
