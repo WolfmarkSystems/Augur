@@ -1,0 +1,45 @@
+[package]
+name = "augur-installer"
+version = "1.0.0"
+edition = "2021"
+description = "AUGUR Installer Wizard — Tauri desktop app."
+license = "Proprietary"
+authors = ["Wolfmark Systems"]
+
+# This crate is excluded from the root cargo workspace
+# (see ../../../Cargo.toml [workspace.exclude]) because Tauri
+# pulls in a heavy GUI dep tree that would slow every workspace
+# build. It is built standalone:
+#   cd apps/augur-installer/src-tauri && cargo build
+
+[lib]
+name = "augur_installer_lib"
+path = "src/lib.rs"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "augur-installer"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-shell = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "io-util", "process"] }
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls"] }
+futures-util = "0.3"
+sha2 = "0.10"
+log = "0.4"
+env_logger = "0.11"
+thiserror = "1"
+
+[features]
+# By default, no custom protocol — wraps everything in the
+# default Tauri 2 webview transport.
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]

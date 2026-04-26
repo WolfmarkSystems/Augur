@@ -1,0 +1,17 @@
+{
+  "$schema": "https://schema.tauri.app/config/capability",
+  "identifier": "default",
+  "description": "Default capability — wizard-only command surface.",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:event:default",
+    "core:event:allow-emit",
+    "core:event:allow-listen",
+    "core:path:default",
+    "core:window:default",
+    "core:app:default",
+    "dialog:default",
+    "shell:default"
+  ]
+}

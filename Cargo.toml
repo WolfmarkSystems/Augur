@@ -16,6 +16,11 @@ members = [
 exclude = [
     "vendor/strata-plugin-sdk",
     "vendor/strata-fs",
+    # Sprint 11 — Tauri installer is built standalone:
+    #   cd apps/augur-installer/src-tauri && cargo build
+    # Excluded so the heavy GUI dep tree is not pulled into the
+    # default `cargo build --workspace`.
+    "apps/augur-installer/src-tauri",
 ]
 
 [workspace.package]
