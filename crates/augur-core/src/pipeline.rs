@@ -514,6 +514,17 @@ pub fn render_csv_row(row: &BatchCsvRow<'_>) -> String {
 /// land in the `error` column.
 pub fn render_batch_csv(report: &BatchResult) -> String {
     let mut out = String::with_capacity(BATCH_CSV_HEADER.len() + report.results.len() * 80);
+    // Sprint 20 P1 — MT advisory invariant for the CSV surface.
+    // pandas / DuckDB / R `read_csv` all skip `#`-prefixed lines
+    // by convention (`comment='#'`); Excel and Numbers ignore
+    // them as well. The advisory rides at the top of every CSV
+    // we produce so the forensic context survives the lightest
+    // tabular form.
+    if !report.machine_translation_notice.is_empty() {
+        out.push_str("# ");
+        out.push_str(&report.machine_translation_notice);
+        out.push('\n');
+    }
     out.push_str(BATCH_CSV_HEADER);
     out.push('\n');
     for r in &report.results {
@@ -757,8 +768,16 @@ mod tests {
     fn batch_csv_output_has_correct_headers() {
         let r = fixture_with_results(3);
         let csv = render_batch_csv(&r);
-        let first_line = csv.lines().next().expect("at least one line");
-        assert_eq!(first_line, BATCH_CSV_HEADER);
+        let mut lines = csv.lines();
+        // Sprint 20 P1 — first line is the MT advisory comment.
+        let first = lines.next().expect("at least one line");
+        assert!(first.starts_with("# "), "first CSV line must be `#` advisory comment, got: {first}");
+        assert!(
+            first.contains("Machine translation"),
+            "advisory comment must carry the MT advisory text, got: {first}"
+        );
+        let header = lines.next().expect("CSV header line");
+        assert_eq!(header, BATCH_CSV_HEADER);
         // Spot-check a translated row makes it through.
         assert!(csv.contains("Hello world"));
         // Boolean is_foreign rendered as `true`/`false`, not `True`/`1`.

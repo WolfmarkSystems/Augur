@@ -21,3 +21,13 @@ pub mod timestamps;
 pub mod yara_scan;
 
 pub use error::AugurError;
+
+/// Sprint 20 — canonical MT advisory text for the workspace.
+/// Source of truth re-exported through `augur-core` so every
+/// crate / app can grab it via `augur_core::MT_ADVISORY` without
+/// pulling the full `augur-translate` dependency just for the
+/// constant. Mirrors `augur_translate::MACHINE_TRANSLATION_NOTICE`
+/// — kept in sync with the workspace-wide quality gate test in
+/// `crates/augur-core/tests/quality_gate.rs`.
+pub const MT_ADVISORY: &str =
+    "Machine translation — verify with a certified human translator for legal proceedings.";
