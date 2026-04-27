@@ -7,6 +7,7 @@
 
 mod benchmark;
 mod install;
+mod live;
 mod package;
 mod selftest;
 
@@ -518,6 +519,27 @@ enum Command {
         threads: usize,
     },
 
+    /// Sprint 19 P1 — real-time microphone translation. Captures
+    /// the default input device, chunks audio every `--chunk-ms`,
+    /// runs each chunk through Whisper STT + classifier + NLLB,
+    /// and emits NDJSON `live_segment` events on stdout. The
+    /// session terminates on SIGINT or when stdin closes.
+    Live {
+        /// Target language ISO 639-1 code.
+        #[arg(long, default_value = "en")]
+        target: String,
+
+        /// Chunk duration in milliseconds. Default 3000 (3s).
+        /// Smaller = lower latency, more compute. Whisper does
+        /// not handle chunks shorter than ~1500 ms reliably.
+        #[arg(long, default_value_t = 3000)]
+        chunk_ms: u64,
+
+        /// Output format. Only `ndjson` is wired today.
+        #[arg(long, default_value = "ndjson")]
+        format: String,
+    },
+
     /// Sprint 10 P1 — manage the model catalog. Three install
     /// tiers (minimal / standard / full); `--list` prints the
     /// catalog without touching the network; `--status` shows what
@@ -855,6 +877,17 @@ fn run(
             )
         }
         Command::Config { action } => cmd_config(action),
+        Command::Live {
+            target,
+            chunk_ms,
+            format,
+        } => {
+            let ndjson = format.eq_ignore_ascii_case("ndjson");
+            if ndjson {
+                NDJSON_MODE.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            live::cmd_live(&target, chunk_ms, ndjson)
+        }
         Command::Install {
             profile,
             list,

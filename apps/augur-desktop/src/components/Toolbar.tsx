@@ -1,5 +1,6 @@
 import { useAppStore, type SttModel, type TranslationEngine } from "../store/appStore";
 import LangPicker from "./LangPicker";
+import { startLiveTranslation, stopLiveTranslation } from "../ipc";
 
 const STT_OPTIONS: { value: SttModel; label: string }[] = [
   { value: "auto", label: "Auto" },
@@ -36,6 +37,8 @@ export default function Toolbar() {
   const activeEngine = useAppStore((s) => s.activeEngine);
   const isTranslating = useAppStore((s) => s.isTranslating);
   const dialect = useAppStore((s) => s.dialect);
+  const liveRecording = useAppStore((s) => s.live.isRecording);
+  const setError = useAppStore((s) => s.setError);
 
   const sourceTrailingNote = dialect
     ? `${dialect.dialect.split(" ")[0]} dialect`
@@ -92,12 +95,35 @@ export default function Toolbar() {
       <div className="toolbar-spacer" />
       <button
         type="button"
+        className={`live-btn live-mic-btn ${liveRecording ? "is-recording" : ""}`}
+        aria-pressed={liveRecording}
+        title={liveRecording ? "Stop live translation" : "Start live translation"}
+        onClick={async () => {
+          try {
+            if (liveRecording) {
+              await stopLiveTranslation();
+            } else {
+              await startLiveTranslation({
+                targetLang: targetLang.code,
+                chunkDurationMs: 3000,
+              });
+            }
+          } catch (e) {
+            setError(`Live mode error: ${String(e)}`);
+          }
+        }}
+      >
+        <span className="live-btn-dot" aria-hidden="true" />
+        🎙 {liveRecording ? "Stop" : "Live"}
+      </button>
+      <button
+        type="button"
         className={`live-btn ${isTranslating ? "is-active" : ""}`}
         aria-pressed={isTranslating}
         disabled
       >
         <span className="live-btn-dot" aria-hidden="true" />
-        {isTranslating ? "Live" : "Idle"}
+        {isTranslating ? "Translating" : "Idle"}
       </button>
     </div>
   );

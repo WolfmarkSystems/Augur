@@ -24,3 +24,9 @@ rayon = "1.12.0"
 zip = "8.6.0"
 sha2 = "0.11.0"
 serde = { version = "1.0.228", features = ["derive"] }
+# Sprint 19 P1 — pure-Rust microphone capture. cpal targets
+# CoreAudio on macOS, ALSA on Linux, WASAPI on Windows. No
+# system library required for the macOS build.
+cpal = "0.15"
+hound = "3.5"
+ctrlc = "3"

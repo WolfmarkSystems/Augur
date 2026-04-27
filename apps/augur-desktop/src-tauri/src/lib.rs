@@ -7,6 +7,7 @@
 pub mod case_state;
 pub mod export;
 pub mod file_load;
+pub mod live_audio;
 pub mod models;
 pub mod pipeline;
 pub mod state;
@@ -50,6 +51,7 @@ pub fn run() {
 
     tauri::Builder::default()
         .manage(state::AppState::default())
+        .manage(live_audio::LiveSessionState::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
         .invoke_handler(tauri::generate_handler![
@@ -75,6 +77,8 @@ pub fn run() {
             case_state::add_recent_file,
             case_state::save_segment_flags,
             case_state::get_segment_flags,
+            live_audio::start_live_translation,
+            live_audio::stop_live_translation,
         ])
         .run(tauri::generate_context!())
         .expect("AUGUR Desktop failed to launch");

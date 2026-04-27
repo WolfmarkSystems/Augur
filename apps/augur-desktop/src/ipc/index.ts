@@ -234,6 +234,65 @@ export async function getSegmentFlags(args: {
   return invoke<unknown[]>("get_segment_flags", args);
 }
 
+// ── Live audio (Sprint 19) ──────────────────────────────────────
+
+export async function startLiveTranslation(args: {
+  targetLang: string;
+  chunkDurationMs: number;
+}): Promise<void> {
+  return invoke<void>("start_live_translation", args);
+}
+
+export async function stopLiveTranslation(): Promise<void> {
+  return invoke<void>("stop_live_translation");
+}
+
+export interface LiveStartedPayload {
+  type: string;
+  target_language: string;
+  device: string;
+  input_channels: number;
+  input_sample_rate_hz: number;
+  chunk_duration_ms: number;
+  machine_translation_notice: string;
+  live_advisory: string;
+}
+
+export interface LiveSegmentPayload {
+  type: string;
+  chunk_index: number;
+  chunk_start_ms: number;
+  chunk_end_ms: number;
+  original: string;
+  translated: string;
+  source_lang: string;
+  confidence: number;
+  machine_translation_notice: string;
+  live_advisory: string;
+}
+
+export function onLiveStarted(
+  cb: (p: LiveStartedPayload) => void,
+): Promise<UnlistenFn> {
+  return listen("live-started", (e) => cb(e.payload as never));
+}
+
+export function onLiveSegment(
+  cb: (p: LiveSegmentPayload) => void,
+): Promise<UnlistenFn> {
+  return listen("live-segment", (e) => cb(e.payload as never));
+}
+
+export function onLiveChunkError(
+  cb: (p: { chunk_index: number; error: string }) => void,
+): Promise<UnlistenFn> {
+  return listen("live-chunk-error", (e) => cb(e.payload as never));
+}
+
+export function onLiveStopped(cb: () => void): Promise<UnlistenFn> {
+  return listen("live-stopped", () => cb());
+}
+
 // ── Pipeline event listeners ────────────────────────────────────
 
 export function onSegmentReady(

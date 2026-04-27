@@ -60,6 +60,34 @@ export interface BatchFileRow {
 
 export type ReviewStatus = "needs_review" | "reviewed" | "disputed";
 
+export interface LiveSegment {
+  chunkIndex: number;
+  chunkStartMs: number;
+  chunkEndMs: number;
+  original: string;
+  translated: string;
+  sourceLang: string;
+  confidence: number;
+}
+
+export interface LiveSessionInfo {
+  device: string;
+  inputChannels: number;
+  inputSampleRateHz: number;
+  chunkDurationMs: number;
+  targetLanguage: string;
+  startedAt: string;
+}
+
+export interface LiveSessionState {
+  isRecording: boolean;
+  startedAt: string | null;
+  endedAt: string | null;
+  info: LiveSessionInfo | null;
+  segments: LiveSegment[];
+  errorMessage: string | null;
+}
+
 export interface SegmentFlag {
   segmentIndex: number;
   flaggedAt: string;

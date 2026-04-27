@@ -11,6 +11,8 @@ import ModelManager from "./components/ModelManager";
 import PackageWizard from "./components/PackageWizard";
 import ReviewPanel from "./components/ReviewPanel";
 import AboutDialog from "./components/AboutDialog";
+import WorkspaceLive from "./components/WorkspaceLive";
+import SaveLiveSessionDialog from "./components/SaveLiveSessionDialog";
 import ErrorBanner, { type ErrorBannerType } from "./components/ErrorBanner";
 import { invoke } from "@tauri-apps/api/core";
 import {
@@ -19,6 +21,10 @@ import {
   checkAugurAvailable,
   getCaseState,
   getSegmentFlags,
+  onLiveChunkError,
+  onLiveSegment,
+  onLiveStarted,
+  onLiveStopped,
   saveSegmentFlags,
   setCaseInfo,
   mtAdvisoryText,
@@ -66,6 +72,7 @@ export default function App() {
   const [showPackageWizard, setShowPackageWizard] = useState(false);
   const [showAdvisory, setShowAdvisory] = useState(false);
   const [showAbout, setShowAbout] = useState(false);
+  const [showSaveLive, setShowSaveLive] = useState(false);
   const [advisoryText, setAdvisoryText] = useState<string>(MT_ADVISORY_FALLBACK);
   const [bannerType, setBannerType] = useState<ErrorBannerType | null>(null);
   const [bannerMessage, setBannerMessage] = useState<string | undefined>();
@@ -77,6 +84,11 @@ export default function App() {
   const setRecentFiles = useAppStore((s) => s.setRecentFiles);
   const flaggedSegments = useAppStore((s) => s.flaggedSegments);
   const hydrateFlags = useAppStore((s) => s.hydrateFlags);
+  const live = useAppStore((s) => s.live);
+  const liveStartStore = useAppStore((s) => s.liveStart);
+  const liveAddSegmentStore = useAppStore((s) => s.liveAddSegment);
+  const liveStopStore = useAppStore((s) => s.liveStop);
+  const liveSetErrorStore = useAppStore((s) => s.liveSetError);
 
   // Subscribe to pipeline events once on mount.
   useEffect(() => {
@@ -142,6 +154,32 @@ export default function App() {
     onBatchError((p) => setError(`Batch failed: ${p.message}`)).then((u) =>
       unlisten.push(u),
     );
+    // Sprint 19 — live audio events
+    onLiveStarted((p) => {
+      liveStartStore({
+        device: p.device,
+        inputChannels: p.input_channels,
+        inputSampleRateHz: p.input_sample_rate_hz,
+        chunkDurationMs: p.chunk_duration_ms,
+        targetLanguage: p.target_language,
+        startedAt: new Date().toISOString(),
+      });
+    }).then((u) => unlisten.push(u));
+    onLiveSegment((p) => {
+      liveAddSegmentStore({
+        chunkIndex: p.chunk_index,
+        chunkStartMs: p.chunk_start_ms,
+        chunkEndMs: p.chunk_end_ms,
+        original: p.original,
+        translated: p.translated,
+        sourceLang: p.source_lang,
+        confidence: p.confidence,
+      });
+    }).then((u) => unlisten.push(u));
+    onLiveChunkError((p) =>
+      liveSetErrorStore(`Chunk ${p.chunk_index}: ${p.error}`),
+    ).then((u) => unlisten.push(u));
+    onLiveStopped(() => liveStopStore()).then((u) => unlisten.push(u));
     // Sprint 13 P4 — startup probe for the augur CLI + non-
     // blocking self-test. Surfaces the four error states named
     // in the sprint spec.
@@ -213,6 +251,10 @@ export default function App() {
     setExaminerStore,
     setAgencyStore,
     setRecentFiles,
+    liveStartStore,
+    liveAddSegmentStore,
+    liveStopStore,
+    liveSetErrorStore,
   ]);
 
   // Sprint 16 P2 — persist case info changes to disk.
@@ -354,7 +396,9 @@ export default function App() {
         }
       />
       <main className="app-body">
-        {batch ? (
+        {live.isRecording || live.segments.length > 0 ? (
+          <WorkspaceLive onSaveSession={() => setShowSaveLive(true)} />
+        ) : batch ? (
           <WorkspaceBatch />
         ) : useAudioWorkspace ? (
           <WorkspaceAudio />
@@ -382,6 +426,11 @@ export default function App() {
       />
 
       <AboutDialog open={showAbout} onClose={() => setShowAbout(false)} />
+
+      <SaveLiveSessionDialog
+        open={showSaveLive}
+        onClose={() => setShowSaveLive(false)}
+      />
 
       {showAdvisory && (
         <div className="overlay" role="dialog" aria-modal="true">

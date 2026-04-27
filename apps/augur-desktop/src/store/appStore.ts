@@ -6,6 +6,9 @@ import type {
   DialectInfo,
   FileKind,
   Language,
+  LiveSegment,
+  LiveSessionInfo,
+  LiveSessionState as LiveState,
   ReviewStatus,
   SegmentFlag,
   TranslationSegment,
@@ -84,6 +87,9 @@ export interface AppState {
   // Sprint 17 P1 — segment flags for the loaded file
   flaggedSegments: Record<number, SegmentFlag>;
 
+  // Sprint 19 — live session
+  live: LiveState;
+
   // View toggles
   showDialectCard: boolean;
   showCodeSwitchBands: boolean;
@@ -123,6 +129,12 @@ export interface AppState {
   setAugurAvailable: (v: boolean, path: string | null) => void;
   setSelfTestFails: (fails: string[]) => void;
   setRecentFiles: (files: AppState["recentFiles"]) => void;
+
+  liveStart: (info: LiveSessionInfo) => void;
+  liveAddSegment: (seg: LiveSegment) => void;
+  liveStop: () => void;
+  liveSetError: (msg: string | null) => void;
+  liveReset: () => void;
 
   flagSegment: (index: number, note: string) => void;
   unflagSegment: (index: number) => void;
@@ -165,6 +177,15 @@ export const useAppStore = create<AppState>((set) => ({
   selfTestFails: [],
   recentFiles: [],
   flaggedSegments: {},
+
+  live: {
+    isRecording: false,
+    startedAt: null,
+    endedAt: null,
+    info: null,
+    segments: [],
+    errorMessage: null,
+  },
 
   showDialectCard: true,
   showCodeSwitchBands: true,
@@ -307,6 +328,45 @@ export const useAppStore = create<AppState>((set) => ({
     set({ augurAvailable: v, augurBinaryPath: path }),
   setSelfTestFails: (fails) => set({ selfTestFails: fails }),
   setRecentFiles: (files) => set({ recentFiles: files }),
+
+  liveStart: (info) =>
+    set({
+      live: {
+        isRecording: true,
+        startedAt: new Date().toISOString(),
+        endedAt: null,
+        info,
+        segments: [],
+        errorMessage: null,
+      },
+    }),
+  liveAddSegment: (seg) =>
+    set((s) => ({
+      live: { ...s.live, segments: [...s.live.segments, seg] },
+    })),
+  liveStop: () =>
+    set((s) => ({
+      live: {
+        ...s.live,
+        isRecording: false,
+        endedAt: new Date().toISOString(),
+      },
+    })),
+  liveSetError: (msg) =>
+    set((s) => ({
+      live: { ...s.live, errorMessage: msg },
+    })),
+  liveReset: () =>
+    set({
+      live: {
+        isRecording: false,
+        startedAt: null,
+        endedAt: null,
+        info: null,
+        segments: [],
+        errorMessage: null,
+      },
+    }),
 
   flagSegment: (index, note) =>
     set((s) => ({
